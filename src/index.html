@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Attendance App - DEPI</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="container">
+    <header class="header">
+      <div class="header-content">
+        <div class="hero-badge">Operations Console</div>
+        <h1>Attendance Automation</h1>
+        <p class="subtitle">DEPI Dashboard Attendance Manager</p>
+        <div class="hero-pills">
+          <span class="hero-pill">Attendance Runs</span>
+          <span class="hero-pill">LMS Upload</span>
+          <span class="hero-pill">Session Sync</span>
+        </div>
+      </div>
+    </header>
+
+    <div class="main-content">
+      <div class="layout-controls">
+        <button id="layoutToggle" class="layout-btn" title="Toggle layout" onclick="toggleLayout()">
+          Vertical Layout
+        </button>
+        <button id="toggleLogBtn" class="layout-btn" title="Show or hide log" onclick="toggleLogPanel()">
+          Hide Log
+        </button>
+      </div>
+
+      <div class="control-panel">
+        <div class="panel-header">
+          <div>
+            <span class="section-tag">Control Center</span>
+            <h2>Run Automation</h2>
+            <p class="section-copy">Set the date range, target groups, and launch the flow you need.</p>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label for="themeSelect">Design Theme:</label>
+          <select id="themeSelect" class="text-input" onchange="changeTheme(this.value)">
+            <option value="midnight">Midnight</option>
+            <option value="daylight">Daylight</option>
+            <option value="forest">Forest</option>
+          </select>
+          <small class="form-hint">Choose the interface style you want to use.</small>
+        </div>
+
+        <div class="form-group">
+          <label for="dateFrom">Date From:</label>
+          <input type="date" id="dateFrom" class="date-input">
+        </div>
+
+        <div class="form-group">
+          <label for="dateTo">Date To:</label>
+          <input type="date" id="dateTo" class="date-input">
+        </div>
+
+        <div class="form-group">
+          <label for="roundFilter">Round:</label>
+          <select id="roundFilter" class="text-input" onchange="refreshGroupOptions()">
+            <option value="">Select a round</option>
+            <option value="4">Round 4</option>
+            <option value="5">Round 5</option>
+          </select>
+          <small class="form-hint">Used by Run Attendance and Edit Dashboard Link, and also narrows the LMS flows. The round is read from the selected group name.</small>
+        </div>
+
+        <div class="form-group">
+          <label for="trackFilter">Track:</label>
+          <div class="track-toggle" id="trackToggle" role="group" aria-label="Track">
+            <button type="button" class="track-btn" data-track="all" onclick="setTrackFilter('all')">All Groups</button>
+            <button type="button" class="track-btn" data-track="technical" onclick="setTrackFilter('technical')">Technical</button>
+            <button type="button" class="track-btn" data-track="nontechnical" onclick="setTrackFilter('nontechnical')">Non-Technical</button>
+          </div>
+          <select id="trackFilter" class="text-input visually-hidden" onchange="handleTrackFilterChange()" tabindex="-1" aria-hidden="true">
+            <option value="all">All Groups</option>
+            <option value="technical">Technical</option>
+            <option value="nontechnical">Non-Technical</option>
+          </select>
+          <small class="form-hint">Applies to Run Attendance, Upload Attendance, Sync / Edit Sessions, and the available Dashboard groups. Technical groups run first, then the Non-Technical groups sign in with the Non-Technical LMS account from .env.</small>
+        </div>
+
+        <div class="form-group">
+          <label for="batchFilter">Owner Batch:</label>
+          <select id="batchFilter" class="text-input" onchange="handleBatchFilterChange()">
+            <option value="">All groups</option>
+            <option value="mohab">Mohab</option>
+            <option value="zeinab">Zeinab</option>
+          </select>
+          <small class="form-hint">Runs only the Round 5 groups assigned to the selected owner for Attendance, Upload, or Sync / Edit. Each owner has Technical and Non-Technical groups, so the Track above narrows them further.</small>
+        </div>
+
+        <div class="form-group">
+          <label for="groupFilter">Group Name (Optional):</label>
+          <input type="text" id="groupFilter" class="text-input" list="groupsList" placeholder="Type a group name or choose from the list">
+          <datalist id="groupsList"></datalist>
+          <small class="form-hint">With an owner selected, leave it empty for all their groups or choose one group only.</small>
+        </div>
+
+        <div class="form-group">
+          <label for="newSessionLink">New Session Link:</label>
+          <input type="url" id="newSessionLink" class="text-input" placeholder="https://zoom.us/j/...">
+          <small class="form-hint">Used only by Edit Dashboard Link. It updates matching Live sessions only; Physical sessions are always skipped without opening Edit.</small>
+        </div>
+
+        <div class="form-group">
+          <label for="lmsView">View (LMS Only):</label>
+          <select id="lmsView" class="text-input">
+            <option value="5">All (view=5)</option>
+            <option value="4" selected>All Past (view=4)</option>
+            <option value="3">Months (view=3)</option>
+            <option value="2">Weeks (view=2)</option>
+            <option value="1">Days (view=1)</option>
+          </select>
+          <small class="form-hint">Used only for Upload Attendance and Sync / Edit Sessions.</small>
+        </div>
+
+        <div class="button-group">
+          <button id="startBtn" class="btn btn-primary" onclick="startProcess()">
+            <span class="btn-icon">Attendance</span> Run Attendance
+          </button>
+          <button id="uploadBtn" class="btn btn-upload" onclick="startLmsUpload()">
+            <span class="btn-icon">LMS</span> Upload Attendance
+          </button>
+          <button id="editBtn" class="btn btn-edit" onclick="startLmsEdit()">
+            <span class="btn-icon">LMS</span> Sync / Edit Sessions
+          </button>
+          <button id="dashboardLinkBtn" class="btn btn-link-edit" onclick="startDashboardLinkEdit()">
+            <span class="btn-icon">Link</span> Edit Dashboard Link
+          </button>
+          <button id="stopBtn" class="btn btn-danger" onclick="stopProcess()" disabled>
+            <span class="btn-icon">Stop</span> Cancel
+          </button>
+          <button id="clearBtn" class="btn btn-secondary" onclick="clearLogs()">
+            <span class="btn-icon">Clear</span> Log
+          </button>
+        </div>
+
+        <div class="status-box">
+          <div class="status-item">
+            <span class="status-label">Status:</span>
+            <span id="status" class="status-value">Ready</span>
+          </div>
+          <div class="status-item">
+            <span class="status-label">Time:</span>
+            <span id="time" class="status-value time-value">--:--:--</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="log-panel">
+        <div class="panel-header">
+          <div>
+            <span class="section-tag">Live Feed</span>
+            <h2>Activity Log</h2>
+            <p class="section-copy">Real-time execution messages from the desktop automation engine.</p>
+          </div>
+          <span class="log-count" id="logCount">(0)</span>
+        </div>
+        <div id="logViewer" class="log-viewer">
+          <div class="log-entry initial">Ready to start...</div>
+        </div>
+      </div>
+    </div>
+
+    <footer class="footer">
+      <p>DEPI Attendance Automation v1.0</p>
+    </footer>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

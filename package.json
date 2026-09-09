@@ -1,0 +1,24 @@
+{
+  "name": "attendance-automation",
+  "version": "1.0.0",
+  "description": "DEPI Attendance Automation with Beautiful GUI",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --enable-logging",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "postinstall": "node scripts/trim-electron-locales.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "dotenv": "^17.2.3",
+    "playwright": "^1.57.0",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "electron": "^44.1.1"
+  }
+}
