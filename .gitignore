@@ -3,3 +3,6 @@
 node_modules/
 scalebun-capture/out/
 exports/
+/student_names_with_emails.xlsx
+/R 5/students_1701.csv
+/lms-bot/groups_sessions_format/
