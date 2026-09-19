@@ -96,10 +96,14 @@
         </div>
 
         <div class="form-group">
-          <label for="groupFilter">Group Name (Optional):</label>
-          <input type="text" id="groupFilter" class="text-input" list="groupsList" placeholder="Type a group name or choose from the list">
+          <label for="groupFilter">Group Names (Optional):</label>
+          <input type="text" id="groupFilter" class="text-input" list="groupsList" placeholder="ONL5_SWD5_G1, ONL5_ISS3_S4 — or leave empty for all">
           <datalist id="groupsList"></datalist>
-          <small class="form-hint">With an owner selected, leave it empty for all their groups or choose one group only.</small>
+          <small class="form-hint">
+            Several groups, separated by a comma. They run one after the other, in the order you type them,
+            and only those groups are asked for from the dashboard. Leave it empty for all groups.
+            Edit Dashboard Link takes one group only.
+          </small>
         </div>
 
         <div class="form-group">

@@ -43,17 +43,33 @@ if (configArg !== -1 && process.argv[configArg + 1]) {
 
 let DATE_FROM = '2026-05-02';
 let DATE_TO = '2026-05-15';
-let GROUP_FILTER = '';
+let GROUP_FILTERS = [];
 let ROUND_FILTER = '';
 let BATCH_FILTER = '';
 let TRACK_FILTER = TRACK_ALL;
+
+// "ONL5_SWD5_G1, ONL5_ISS3_S4" -> ["ONL5_SWD5_G1", "ONL5_ISS3_S4"].
+// Groups are run one after the other, in the order they were typed.
+function parseGroupList(raw) {
+  const seen = new Set();
+  const groups = [];
+  for (const part of String(raw || '').split(/[,;\r\n]+/)) {
+    const name = part.trim();
+    if (!name) continue;
+    const key = name.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    groups.push(name);
+  }
+  return groups;
+}
 
 if (configFile && fs.existsSync(configFile)) {
   try {
     const config = JSON.parse(fs.readFileSync(configFile, 'utf-8'));
     if (config.dateFrom) DATE_FROM = config.dateFrom;
     if (config.dateTo) DATE_TO = config.dateTo;
-    if (config.groupFilter) GROUP_FILTER = String(config.groupFilter).trim();
+    if (config.groupFilter) GROUP_FILTERS = parseGroupList(config.groupFilter);
     if (config.roundFilter) ROUND_FILTER = String(config.roundFilter).trim();
     if (config.batchFilter) BATCH_FILTER = String(config.batchFilter).trim().toLowerCase();
     if (config.trackFilter) TRACK_FILTER = normalizeTrack(config.trackFilter);
@@ -75,6 +91,15 @@ const EXPORT_DIR = './exports';
 if (!fs.existsSync(EXPORT_DIR)) fs.mkdirSync(EXPORT_DIR, { recursive: true });
 
 const BATCH_GROUPS = new Set(GROUP_BATCHES[BATCH_FILTER] || []);
+const GROUP_FILTER_SET = new Set(GROUP_FILTERS.map((group) => normalize(group)));
+
+// The dashboard calls Round 4 "first" and Round 5 "second"; that is the value
+// its own sessions page puts in the URL (?round=second&group=<id>).
+function dashboardRoundParam(round) {
+  if (round === '4') return 'first';
+  if (round === '5') return 'second';
+  return '';
+}
 
 /* =======================
    API SETTINGS
@@ -520,12 +545,20 @@ function createApiClient(page, headers) {
   return { get };
 }
 
-async function listDaySessionsPaged(api, day) {
+/* Asks the sessions API for one slice and follows its pages.
+   extra: { group: '<id>', round: 'second' } — exactly the filters the
+   dashboard itself puts in its URL, so the API returns only what is wanted
+   instead of every session in the date range. */
+async function listSessionsPaged(api, fromIso, toIso, extra = {}) {
   const params = new URLSearchParams({
-    date_from: day,
-    date_to: day,
+    date_from: fromIso,
+    date_to: toIso,
     page_size: String(API_PAGE_SIZE),
   });
+  for (const [key, value] of Object.entries(extra)) {
+    if (value) params.set(key, value);
+  }
+
   let next = `${API_BASE}/admin/sessions/?${params}`;
   const byId = new Map();
   let expected = null;
@@ -540,6 +573,10 @@ async function listDaySessionsPaged(api, day) {
   }
 
   return { byId, expected: expected ?? 0 };
+}
+
+async function listDaySessionsPaged(api, day) {
+  return listSessionsPaged(api, day, day, { round: dashboardRoundParam(ROUND_FILTER) });
 }
 
 let dropdownGroupsCache = null;
@@ -569,14 +606,12 @@ async function listDaySessions(api, day) {
   for (let i = 0; i < groups.length; i += 10) {
     const chunk = groups.slice(i, i + 10);
     const results = await Promise.all(chunk.map(async (group) => {
-      const params = new URLSearchParams({
-        date_from: day,
-        date_to: day,
+      // Same filters as the day query above, so the counts stay comparable.
+      const { byId: groupSessions } = await listSessionsPaged(api, day, day, {
         group: group.id,
-        page_size: String(API_PAGE_SIZE),
+        round: dashboardRoundParam(ROUND_FILTER),
       });
-      const payload = await api.get(`${API_BASE}/admin/sessions/?${params}`);
-      return payload.data || [];
+      return [...groupSessions.values()];
     }));
     for (const session of results.flat()) {
       if (session?.id) byId.set(session.id, session);
@@ -586,7 +621,54 @@ async function listDaySessions(api, day) {
   return { sessions: [...byId.values()], expected };
 }
 
+/* One request per selected group, over the whole date range.
+   The dashboard takes one group id per request (a second `group` replaces the
+   first), so the groups are asked for one after the other, in the order they
+   were typed. */
+async function listSessionsForGroups(api, fromIso, toIso, groupNames) {
+  const dashboardGroups = await getAllDashboardGroups(api);
+  const idByName = new Map(dashboardGroups.map((group) => [normalize(group.name), group.id]));
+  const round = dashboardRoundParam(ROUND_FILTER);
+
+  const all = new Map();
+  const unknown = [];
+  const incomplete = [];
+
+  for (const name of groupNames) {
+    const id = idByName.get(normalize(name));
+    if (!id) {
+      unknown.push(name);
+      console.log(`[WARN] Group "${name}" is not on the dashboard — skipped.`);
+      continue;
+    }
+
+    const { byId, expected } = await listSessionsPaged(api, fromIso, toIso, { group: id, round });
+    for (const session of byId.values()) all.set(session.id, session);
+    console.log(`👥 ${name}: ${byId.size} sessions (dashboard total ${expected})`);
+    if (byId.size < expected) incomplete.push(`${name} (${byId.size}/${expected})`);
+  }
+
+  if (incomplete.length) {
+    throw new Error(
+      `The dashboard API did not return every session for: ${incomplete.join(', ')}. ` +
+      `Stopping instead of exporting an incomplete list.`
+    );
+  }
+  if (!all.size && unknown.length === groupNames.length) {
+    throw new Error(
+      `None of the selected groups exist on the dashboard: ${unknown.join(', ')}.`
+    );
+  }
+
+  return [...all.values()];
+}
+
 async function listAllSessions(api, fromIso, toIso) {
+  // With groups selected, only those groups are asked for.
+  if (GROUP_FILTERS.length) {
+    return listSessionsForGroups(api, fromIso, toIso, GROUP_FILTERS);
+  }
+
   const all = new Map();
   const incompleteDays = [];
 
@@ -690,7 +772,10 @@ async function runWithConcurrency(items, limit, worker) {
 
     assertIsoDate(DATE_FROM);
     assertIsoDate(DATE_TO);
-    console.log(`Round filter: ${ROUND_FILTER || 'none'}`);
+    console.log(`Round filter: ${ROUND_FILTER || 'none'}${ROUND_FILTER ? ` (dashboard: ${dashboardRoundParam(ROUND_FILTER)})` : ''}`);
+    console.log(
+      `Groups: ${GROUP_FILTERS.length ? `${GROUP_FILTERS.length} selected -> ${GROUP_FILTERS.join(', ')}` : 'all groups'}`
+    );
     console.log(`Owner batch: ${BATCH_FILTER || 'all groups'}`);
     console.log(`Track: ${trackLabel(TRACK_FILTER)}`);
     if (compareIso(DATE_TO, DATE_FROM) < 0) {
@@ -714,8 +799,10 @@ async function runWithConcurrency(items, limit, worker) {
         );
       }
     }
-    if (GROUP_FILTER && !groups.some((g) => normalize(g.group) === normalize(GROUP_FILTER))) {
-      console.log(`Warning: group "${GROUP_FILTER}" not found in ${path.basename(groupsWorkbookPath)}.`);
+    for (const name of GROUP_FILTERS) {
+      if (!groups.some((g) => normalize(g.group) === normalize(name))) {
+        console.log(`Warning: group "${name}" not found in ${path.basename(groupsWorkbookPath)}.`);
+      }
     }
     console.log('📄 Groups loaded:', groups.map(g => g.group));
 
@@ -788,7 +875,7 @@ async function runWithConcurrency(items, limit, worker) {
 
       const groupRound = group.match(/^[A-Za-z]{3,4}([45])/)?.[1] || '';
       if (
-        (GROUP_FILTER && normalize(group) !== normalize(GROUP_FILTER)) ||
+        (GROUP_FILTER_SET.size && !GROUP_FILTER_SET.has(normalize(group))) ||
         (BATCH_GROUPS.size && !BATCH_GROUPS.has(group)) ||
         (ROUND_FILTER && groupRound !== ROUND_FILTER)
       ) {
@@ -1007,7 +1094,7 @@ async function runWithConcurrency(items, limit, worker) {
         round: ROUND_FILTER,
         owner: BATCH_FILTER,
         track: TRACK_FILTER,
-        group: GROUP_FILTER,
+        group: GROUP_FILTERS.join(', '),
       },
       dashboardSessions: allSessions.length,
       discoveredCount: workItems.length,

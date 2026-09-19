@@ -157,9 +157,10 @@ function handleTrackFilterChange({ save = true } = {}) {
 
   updateTrackButtons(trackFilter);
 
-  const selectedGroup = groupFilter?.value.trim();
-  if (selectedGroup && conflictsWithTrackFilter(selectedGroup, trackFilter)) {
-    groupFilter.value = '';
+  if (groupFilter?.value.trim()) {
+    groupFilter.value = parseGroupList(groupFilter.value)
+      .filter((group) => !conflictsWithTrackFilter(group, trackFilter))
+      .join(', ');
   }
 
   refreshGroupOptions();
@@ -179,6 +180,20 @@ function getGroupRound(groupName) {
   return String(groupName || '').trim().toUpperCase().match(/^[A-Z]{3,4}([45])/)?.[1] || '';
 }
 
+// The group box takes several groups, separated by a comma. They are run one
+// after the other, in the order they were typed.
+function parseGroupList(raw) {
+  const seen = new Set();
+  const groups = [];
+  for (const part of String(raw || '').split(/[,;\r\n]+/)) {
+    const name = part.trim();
+    if (!name || seen.has(name.toUpperCase())) continue;
+    seen.add(name.toUpperCase());
+    groups.push(name);
+  }
+  return groups;
+}
+
 function handleBatchFilterChange({ save = true } = {}) {
   const batchFilter = document.getElementById('batchFilter')?.value || '';
   const roundFilter = document.getElementById('roundFilter');
@@ -187,8 +202,12 @@ function handleBatchFilterChange({ save = true } = {}) {
   if (batchFilter) {
     roundFilter.value = '5';
     const ownerGroups = availableGroupBatches[batchFilter] || [];
-    if (groupFilter.value && ownerGroups.length && !ownerGroups.includes(groupFilter.value.trim())) {
-      groupFilter.value = '';
+    if (groupFilter.value && ownerGroups.length) {
+      // Only the groups that do not belong to this owner are dropped; the rest
+      // of what was typed stays.
+      groupFilter.value = parseGroupList(groupFilter.value)
+        .filter((group) => ownerGroups.includes(group))
+        .join(', ');
     }
   }
 
@@ -231,12 +250,18 @@ function getFormValues(requireRound = false) {
   const trackFilter = getTrackFilter();
   const lmsView = document.getElementById('lmsView').value;
 
+  const selectedGroups = parseGroupList(groupFilter);
+  groupFilter = selectedGroups.join(',');
+
   if (batchFilter) {
     roundFilter = '5';
     document.getElementById('roundFilter').value = '5';
     const ownerGroups = availableGroupBatches[batchFilter] || [];
-    if (groupFilter && ownerGroups.length && !ownerGroups.includes(groupFilter)) {
-      addLogEntry(`The selected group does not belong to ${batchFilter}.`, 'error');
+    const outsiders = ownerGroups.length
+      ? selectedGroups.filter((group) => !ownerGroups.includes(group))
+      : [];
+    if (outsiders.length) {
+      addLogEntry(`These groups do not belong to ${batchFilter}: ${outsiders.join(', ')}`, 'error');
       return null;
     }
   }
@@ -256,14 +281,24 @@ function getFormValues(requireRound = false) {
     return null;
   }
 
-  if (requireRound && groupFilter && getGroupRound(groupFilter) && getGroupRound(groupFilter) !== roundFilter) {
-    addLogEntry(`The selected group belongs to Round ${getGroupRound(groupFilter)}, not Round ${roundFilter}.`, 'error');
-    return null;
+  if (requireRound) {
+    const wrongRound = selectedGroups.filter(
+      (group) => getGroupRound(group) && getGroupRound(group) !== roundFilter
+    );
+    if (wrongRound.length) {
+      addLogEntry(
+        `These groups are not in Round ${roundFilter}: ` +
+        wrongRound.map((group) => `${group} (Round ${getGroupRound(group)})`).join(', '),
+        'error'
+      );
+      return null;
+    }
   }
 
-  if (groupFilter && conflictsWithTrackFilter(groupFilter, trackFilter)) {
+  const wrongTrack = selectedGroups.filter((group) => conflictsWithTrackFilter(group, trackFilter));
+  if (wrongTrack.length) {
     addLogEntry(
-      `The selected group is not part of the ${TRACK_LABELS[trackFilter]} track.`,
+      `These groups are not part of the ${TRACK_LABELS[trackFilter]} track: ${wrongTrack.join(', ')}`,
       'error'
     );
     return null;
@@ -406,8 +441,14 @@ function startDashboardLinkEdit() {
   if (!formValues) return;
 
   const newLink = document.getElementById('newSessionLink').value.trim();
-  if (!formValues.groupFilter) {
-    addLogEntry('Choose one Group Name before editing dashboard session links.', 'error');
+  const linkGroups = parseGroupList(formValues.groupFilter);
+  if (linkGroups.length !== 1) {
+    addLogEntry(
+      linkGroups.length
+        ? 'Edit Dashboard Link works on one group at a time. Leave a single group in the box.'
+        : 'Choose one Group Name before editing dashboard session links.',
+      'error'
+    );
     return;
   }
   try {
