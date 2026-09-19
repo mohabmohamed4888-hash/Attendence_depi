@@ -265,7 +265,10 @@ function lmsUploadStep(config) {
     args: ['-X', 'utf8', '-u', path.join('lms-bot', 'upload.py')],
     options: {
       cwd: __dirname,
-      env: lmsEnv(config, { START_FROM_DATE: config.dateFrom || '' }),
+      env: lmsEnv(config, {
+        START_FROM_DATE: config.dateFrom || '',
+        FORCE_REUPLOAD: config.forceReupload ? 'true' : 'false',
+      }),
     },
   };
 }

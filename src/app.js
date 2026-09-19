@@ -32,6 +32,7 @@ const TRACK_LABELS = {
 
 document.addEventListener('DOMContentLoaded', () => {
   initializeApp();
+  setupGroupPicker();
   loadFormPreferences();
   setupFormPreferenceSaving();
   setupWheelScrolling();
@@ -97,25 +98,257 @@ async function loadGroupOptions() {
   }
 }
 
-function refreshGroupOptions() {
+/* =======================
+   GROUP PICKER
+   The picked groups live in selectedGroups and are mirrored into the hidden
+   groupFilter input, which is what the rest of the app reads. They show up as
+   chips above the box, each with an x to drop it, and the list below scrolls.
+======================= */
+
+let selectedGroups = [];
+let activeOptionIndex = -1;
+
+function getSelectedGroups() {
+  return [...selectedGroups];
+}
+
+function setSelectedGroups(groups, { save = true, refresh = true } = {}) {
+  selectedGroups = parseGroupList(Array.isArray(groups) ? groups.join(',') : groups);
+
+  const hidden = document.getElementById('groupFilter');
+  if (hidden) hidden.value = selectedGroups.join(',');
+
+  renderGroupChips();
+  if (refresh) refreshGroupOptions();
+  if (save) saveFormPreferences();
+}
+
+function addSelectedGroup(group) {
+  const name = String(group || '').trim();
+  if (!name) return;
+  if (selectedGroups.some((g) => g.toUpperCase() === name.toUpperCase())) return;
+  setSelectedGroups([...selectedGroups, name]);
+}
+
+function removeSelectedGroup(group) {
+  setSelectedGroups(
+    selectedGroups.filter((g) => g.toUpperCase() !== String(group).trim().toUpperCase())
+  );
+}
+
+function renderGroupChips() {
+  const container = document.getElementById('groupChips');
+  if (!container) return;
+  container.innerHTML = '';
+
+  selectedGroups.forEach((group, index) => {
+    const chip = document.createElement('span');
+    chip.className = 'group-chip';
+
+    const order = document.createElement('span');
+    order.className = 'chip-order';
+    order.textContent = `${index + 1}.`;
+    chip.appendChild(order);
+
+    const name = document.createElement('span');
+    name.textContent = group;
+    chip.appendChild(name);
+
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.textContent = '×';
+    remove.title = `Remove ${group}`;
+    remove.setAttribute('aria-label', `Remove ${group}`);
+    remove.disabled = isRunning;
+    remove.addEventListener('click', () => removeSelectedGroup(group));
+    chip.appendChild(remove);
+
+    container.appendChild(chip);
+  });
+
+  if (selectedGroups.length > 1) {
+    const clear = document.createElement('button');
+    clear.type = 'button';
+    clear.className = 'group-chip chip-clear';
+    clear.textContent = `Clear all (${selectedGroups.length})`;
+    clear.disabled = isRunning;
+    clear.addEventListener('click', () => setSelectedGroups([]));
+    container.appendChild(clear);
+  }
+}
+
+// The groups that can still be picked, narrowed by round, owner and track,
+// and by whatever is typed in the search box.
+function availableGroupChoices() {
   const roundFilter = document.getElementById('roundFilter')?.value || '';
   const batchFilter = document.getElementById('batchFilter')?.value || '';
   const trackFilter = getTrackFilter();
-  const dataList = document.getElementById('groupsList');
-  if (!dataList) return;
-  dataList.innerHTML = '';
+  const search = (document.getElementById('groupSearch')?.value || '').trim().toUpperCase();
+  const taken = new Set(selectedGroups.map((group) => group.toUpperCase()));
 
   const ownerGroups = availableGroupBatches[batchFilter] || null;
-  const sourceGroups = ownerGroups || availableGroups;
-
-  sourceGroups
+  return (ownerGroups || availableGroups)
+    .filter((group) => !taken.has(group.toUpperCase()))
     .filter((group) => !roundFilter || getGroupRound(group) === roundFilter)
     .filter((group) => matchesTrackFilter(group, trackFilter))
-    .forEach((group) => {
-      const option = document.createElement('option');
-      option.value = group;
-      dataList.appendChild(option);
+    .filter((group) => !search || group.toUpperCase().includes(search));
+}
+
+function refreshGroupOptions() {
+  const list = document.getElementById('groupOptions');
+  if (!list) return;
+
+  const choices = availableGroupChoices();
+  list.innerHTML = '';
+  activeOptionIndex = -1;
+
+  if (!choices.length) {
+    const empty = document.createElement('div');
+    empty.className = 'group-empty';
+    empty.textContent = selectedGroups.length
+      ? 'No other group matches the filters above.'
+      : 'No group matches the filters above.';
+    list.appendChild(empty);
+    return;
+  }
+
+  choices.forEach((group) => {
+    const option = document.createElement('button');
+    option.type = 'button';
+    option.className = 'group-option';
+    option.setAttribute('role', 'option');
+    option.dataset.group = group;
+
+    const name = document.createElement('span');
+    name.textContent = group;
+    option.appendChild(name);
+
+    const track = getGroupTrack(group);
+    if (track) {
+      const tag = document.createElement('span');
+      tag.className = 'option-track';
+      tag.textContent = TRACK_LABELS[track] || track;
+      option.appendChild(tag);
+    }
+
+    option.addEventListener('click', () => {
+      addSelectedGroup(group);
+      const search = document.getElementById('groupSearch');
+      if (search) {
+        search.value = '';
+        search.focus();
+      }
+      refreshGroupOptions();
+      openGroupOptions();
     });
+
+    list.appendChild(option);
+  });
+}
+
+/* The control panel scrolls, so a list opened near its bottom edge would be
+   cut off. Give it the room that is left, and scroll the panel so it fits. */
+function fitGroupOptions() {
+  const list = document.getElementById('groupOptions');
+  const picker = document.querySelector('.group-picker');
+  const panel = document.querySelector('.control-panel');
+  if (!list || list.hidden || !picker || !panel) return;
+
+  const panelRect = panel.getBoundingClientRect();
+  const pickerRect = picker.getBoundingClientRect();
+
+  const roomBelow = panelRect.bottom - pickerRect.bottom - 16;
+  const roomAfterScrolling = Math.min(panelRect.height - pickerRect.height - 24, 260);
+  list.style.maxHeight = `${Math.max(140, Math.min(260, Math.max(roomBelow, roomAfterScrolling)))}px`;
+
+  const overflow = list.getBoundingClientRect().bottom - panelRect.bottom;
+  if (overflow > 0) panel.scrollTop += overflow + 12;
+}
+
+function openGroupOptions() {
+  const list = document.getElementById('groupOptions');
+  const search = document.getElementById('groupSearch');
+  if (!list || search?.disabled) return;
+  list.hidden = false;
+  search?.setAttribute('aria-expanded', 'true');
+  // Measured straight away: a window that is not painting (minimised, or in
+  // the background) never runs requestAnimationFrame, and the list would then
+  // stay clipped.
+  fitGroupOptions();
+}
+
+function closeGroupOptions() {
+  const list = document.getElementById('groupOptions');
+  if (!list) return;
+  list.hidden = true;
+  activeOptionIndex = -1;
+  document.getElementById('groupSearch')?.setAttribute('aria-expanded', 'false');
+}
+
+function moveActiveOption(step) {
+  const options = [...document.querySelectorAll('#groupOptions .group-option')];
+  if (!options.length) return;
+
+  activeOptionIndex = (activeOptionIndex + step + options.length) % options.length;
+  options.forEach((option, index) => option.classList.toggle('is-active', index === activeOptionIndex));
+  options[activeOptionIndex].scrollIntoView({ block: 'nearest' });
+}
+
+function setupGroupPicker() {
+  const search = document.getElementById('groupSearch');
+  const toggle = document.getElementById('groupToggle');
+  const picker = search?.closest('.group-picker');
+  if (!search || !picker) return;
+
+  search.addEventListener('focus', () => {
+    refreshGroupOptions();
+    openGroupOptions();
+  });
+
+  search.addEventListener('input', () => {
+    refreshGroupOptions();
+    openGroupOptions();
+  });
+
+  search.addEventListener('keydown', (keyEvent) => {
+    if (keyEvent.key === 'ArrowDown' || keyEvent.key === 'ArrowUp') {
+      keyEvent.preventDefault();
+      openGroupOptions();
+      moveActiveOption(keyEvent.key === 'ArrowDown' ? 1 : -1);
+      return;
+    }
+    if (keyEvent.key === 'Enter') {
+      keyEvent.preventDefault();
+      const options = [...document.querySelectorAll('#groupOptions .group-option')];
+      // Enter picks the highlighted row, or the only row left after a search.
+      const chosen = options[activeOptionIndex] || (options.length === 1 ? options[0] : null);
+      if (chosen) chosen.click();
+      return;
+    }
+    if (keyEvent.key === 'Escape') {
+      closeGroupOptions();
+      return;
+    }
+    // Backspace on an empty box drops the last chip.
+    if (keyEvent.key === 'Backspace' && !search.value && selectedGroups.length) {
+      removeSelectedGroup(selectedGroups[selectedGroups.length - 1]);
+    }
+  });
+
+  toggle?.addEventListener('click', () => {
+    const list = document.getElementById('groupOptions');
+    if (list && !list.hidden) {
+      closeGroupOptions();
+      return;
+    }
+    refreshGroupOptions();
+    openGroupOptions();
+    search.focus();
+  });
+
+  document.addEventListener('click', (clickEvent) => {
+    if (!picker.contains(clickEvent.target)) closeGroupOptions();
+  });
 }
 
 function getTrackFilter() {
@@ -153,14 +386,14 @@ function handleTrackFilterChange({ save = true } = {}) {
   }
 
   const trackFilter = getTrackFilter();
-  const groupFilter = document.getElementById('groupFilter');
 
   updateTrackButtons(trackFilter);
 
-  if (groupFilter?.value.trim()) {
-    groupFilter.value = parseGroupList(groupFilter.value)
-      .filter((group) => !conflictsWithTrackFilter(group, trackFilter))
-      .join(', ');
+  if (selectedGroups.length) {
+    setSelectedGroups(
+      selectedGroups.filter((group) => !conflictsWithTrackFilter(group, trackFilter)),
+      { save: false, refresh: false }
+    );
   }
 
   refreshGroupOptions();
@@ -202,16 +435,17 @@ function handleBatchFilterChange({ save = true } = {}) {
   if (batchFilter) {
     roundFilter.value = '5';
     const ownerGroups = availableGroupBatches[batchFilter] || [];
-    if (groupFilter.value && ownerGroups.length) {
+    if (selectedGroups.length && ownerGroups.length) {
       // Only the groups that do not belong to this owner are dropped; the rest
-      // of what was typed stays.
-      groupFilter.value = parseGroupList(groupFilter.value)
-        .filter((group) => ownerGroups.includes(group))
-        .join(', ');
+      // of what was picked stays.
+      setSelectedGroups(
+        selectedGroups.filter((group) => ownerGroups.includes(group)),
+        { save: false, refresh: false }
+      );
     }
   }
 
-  groupFilter.disabled = isRunning;
+  if (groupFilter) groupFilter.disabled = isRunning;
   refreshGroupOptions();
   if (save) saveFormPreferences();
 }
@@ -220,11 +454,16 @@ function setFormDisabled(disabled) {
   document.getElementById('dateFrom').disabled = disabled;
   document.getElementById('dateTo').disabled = disabled;
   document.getElementById('groupFilter').disabled = disabled;
+  document.getElementById('groupSearch').disabled = disabled;
+  document.getElementById('groupToggle').disabled = disabled;
+  if (disabled) closeGroupOptions();
+  renderGroupChips();
   document.getElementById('roundFilter').disabled = disabled;
   document.getElementById('batchFilter').disabled = disabled;
   document.getElementById('trackFilter').disabled = disabled;
   document.getElementById('lmsView').disabled = disabled;
   document.getElementById('newSessionLink').disabled = disabled;
+  document.getElementById('forceReupload').disabled = disabled;
   updateTrackButtons(getTrackFilter());
 
   if (!disabled) {
@@ -249,16 +488,18 @@ function getFormValues(requireRound = false) {
   const batchFilter = document.getElementById('batchFilter').value;
   const trackFilter = getTrackFilter();
   const lmsView = document.getElementById('lmsView').value;
+  // Deliberately not remembered between runs: it has to be ticked on purpose.
+  const forceReupload = document.getElementById('forceReupload').checked;
 
-  const selectedGroups = parseGroupList(groupFilter);
-  groupFilter = selectedGroups.join(',');
+  const chosenGroups = parseGroupList(groupFilter);
+  groupFilter = chosenGroups.join(',');
 
   if (batchFilter) {
     roundFilter = '5';
     document.getElementById('roundFilter').value = '5';
     const ownerGroups = availableGroupBatches[batchFilter] || [];
     const outsiders = ownerGroups.length
-      ? selectedGroups.filter((group) => !ownerGroups.includes(group))
+      ? chosenGroups.filter((group) => !ownerGroups.includes(group))
       : [];
     if (outsiders.length) {
       addLogEntry(`These groups do not belong to ${batchFilter}: ${outsiders.join(', ')}`, 'error');
@@ -282,7 +523,7 @@ function getFormValues(requireRound = false) {
   }
 
   if (requireRound) {
-    const wrongRound = selectedGroups.filter(
+    const wrongRound = chosenGroups.filter(
       (group) => getGroupRound(group) && getGroupRound(group) !== roundFilter
     );
     if (wrongRound.length) {
@@ -295,7 +536,7 @@ function getFormValues(requireRound = false) {
     }
   }
 
-  const wrongTrack = selectedGroups.filter((group) => conflictsWithTrackFilter(group, trackFilter));
+  const wrongTrack = chosenGroups.filter((group) => conflictsWithTrackFilter(group, trackFilter));
   if (wrongTrack.length) {
     addLogEntry(
       `These groups are not part of the ${TRACK_LABELS[trackFilter]} track: ${wrongTrack.join(', ')}`,
@@ -304,7 +545,7 @@ function getFormValues(requireRound = false) {
     return null;
   }
 
-  return { dateFrom, dateTo, groupFilter, roundFilter, batchFilter, trackFilter, lmsView };
+  return { dateFrom, dateTo, groupFilter, roundFilter, batchFilter, trackFilter, lmsView, forceReupload };
 }
 
 function loadFormPreferences() {
@@ -315,6 +556,11 @@ function loadFormPreferences() {
       if (element && typeof saved[id] === 'string') {
         element.value = saved[id];
       }
+    });
+    // The hidden field was just restored; rebuild the chips from it.
+    setSelectedGroups(document.getElementById('groupFilter')?.value || '', {
+      save: false,
+      refresh: false,
     });
     handleTrackFilterChange({ save: false });
     handleBatchFilterChange({ save: false });
@@ -334,14 +580,19 @@ function saveFormPreferences() {
 function setupFormPreferenceSaving() {
   FORM_FIELD_IDS.forEach((id) => {
     const element = document.getElementById(id);
-    if (!element) return;
-    const eventName = id === 'groupFilter' ? 'input' : 'change';
-    element.addEventListener(eventName, saveFormPreferences);
+    // groupFilter is hidden and written by the picker, which saves by itself.
+    if (!element || id === 'groupFilter') return;
+    element.addEventListener('change', saveFormPreferences);
   });
 }
 
 function setupWheelScrolling() {
   document.addEventListener('wheel', (event) => {
+    // A list that scrolls on its own keeps its own wheel: without this the
+    // panel below it moved instead and the group list could not be scrolled.
+    const ownScroller = event.target.closest('.group-options');
+    if (ownScroller && ownScroller.scrollHeight > ownScroller.clientHeight) return;
+
     const scrollContainer = event.target.closest('.control-panel, .log-viewer');
     if (!scrollContainer || scrollContainer.scrollHeight <= scrollContainer.clientHeight) return;
 
@@ -373,11 +624,31 @@ function startProcess() {
   window.electron.startAttendance(formValues);
 }
 
+// Replacing attendance that is already on the LMS is not something to do by
+// accident, so the scope is shown and confirmed first.
+function confirmForceReupload(formValues) {
+  if (!formValues.forceReupload) return true;
+
+  const groups = parseGroupList(formValues.groupFilter);
+  return window.confirm(
+    'Re-upload sessions that already have attendance?\n\n' +
+    `Dates: ${formValues.dateFrom} to ${formValues.dateTo}\n` +
+    `Groups: ${groups.length ? groups.join(', ') : (formValues.batchFilter || 'ALL GROUPS')}\n` +
+    `Track: ${TRACK_LABELS[formValues.trackFilter]}\n\n` +
+    'The attendance now on the LMS for those sessions is replaced by what is in the CSV files.\n' +
+    'Untick the box to skip sessions that already have attendance.'
+  );
+}
+
 // Attendance -> Sync / Edit sessions -> Upload, one after the other with no
 // waiting in between. The main process stops the run if a step fails.
 function startFullRun() {
   const formValues = getFormValues(true);
   if (!formValues) return;
+  if (!confirmForceReupload(formValues)) {
+    addLogEntry('Full run cancelled.', 'info');
+    return;
+  }
 
   beginRun('full-run', 'Running Everything');
   addLogEntry('Full run: Attendance -> Sync / Edit Sessions -> Upload Attendance', 'info');
@@ -410,6 +681,14 @@ function cleanExports() {
 function startLmsUpload() {
   const formValues = getFormValues();
   if (!formValues) return;
+  if (!confirmForceReupload(formValues)) {
+    addLogEntry('Upload cancelled.', 'info');
+    return;
+  }
+
+  if (formValues.forceReupload) {
+    addLogEntry('Re-upload option is ON: sessions that already have attendance will be uploaded again.', 'warning');
+  }
 
   beginRun('lms-upload', 'Running LMS Upload');
   window.electron.startLmsUpload({
@@ -419,6 +698,7 @@ function startLmsUpload() {
     batchFilter: formValues.batchFilter,
     trackFilter: formValues.trackFilter,
     lmsView: formValues.lmsView,
+    forceReupload: formValues.forceReupload,
   });
 }
 

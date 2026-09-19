@@ -96,12 +96,22 @@
         </div>
 
         <div class="form-group">
-          <label for="groupFilter">Group Names (Optional):</label>
-          <input type="text" id="groupFilter" class="text-input" list="groupsList" placeholder="ONL5_SWD5_G1, ONL5_ISS3_S4 — or leave empty for all">
-          <datalist id="groupsList"></datalist>
+          <label for="groupSearch">Group Names (Optional):</label>
+
+          <div id="groupChips" class="group-chips" aria-live="polite"></div>
+
+          <div class="group-picker">
+            <input type="text" id="groupSearch" class="text-input" autocomplete="off"
+                   placeholder="Click to pick groups, or type to search"
+                   aria-expanded="false" aria-controls="groupOptions">
+            <button type="button" id="groupToggle" class="group-toggle" aria-label="Show groups">&#9662;</button>
+            <div id="groupOptions" class="group-options" role="listbox" hidden></div>
+          </div>
+          <input type="hidden" id="groupFilter">
+
           <small class="form-hint">
-            Several groups, separated by a comma. They run one after the other, in the order you type them,
-            and only those groups are asked for from the dashboard. Leave it empty for all groups.
+            Pick as many groups as you want. They run one after the other, in the order you pick them, and only
+            those groups are asked for from the dashboard. Leave it empty for all groups.
             Edit Dashboard Link takes one group only.
           </small>
         </div>
@@ -110,6 +120,18 @@
           <label for="newSessionLink">New Session Link:</label>
           <input type="url" id="newSessionLink" class="text-input" placeholder="https://zoom.us/j/...">
           <small class="form-hint">Used only by Edit Dashboard Link. It updates matching Live sessions only; Physical sessions are always skipped without opening Edit.</small>
+        </div>
+
+        <div class="form-group">
+          <label class="checkbox-row" for="forceReupload">
+            <input type="checkbox" id="forceReupload">
+            <span>Re-upload sessions that already have attendance</span>
+          </label>
+          <small class="form-hint">
+            Used by Upload Attendance and Run Everything. Leave it off for normal runs: a session whose
+            attendance is already on the LMS is skipped. Tick it when attendance was taken wrong and has to
+            be replaced from the CSV. Narrow it down with the dates and the group names first.
+          </small>
         </div>
 
         <div class="form-group">

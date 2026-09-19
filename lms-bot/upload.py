@@ -42,6 +42,10 @@ SHORT_TIMEOUT_MS = int(os.getenv("SHORT_TIMEOUT_MS", "6000"))
 INTER_SESSION_PAUSE_MS = int(os.getenv("INTER_SESSION_PAUSE_MS", "1500"))
 
 DRY_RUN = os.getenv("DRY_RUN", "false").strip().lower() == "true"
+# Ticked in the app when attendance was taken wrong on the LMS and has to be
+# replaced: sessions that already have attendance are uploaded again through
+# "Change attendance" instead of being skipped.
+FORCE_REUPLOAD = os.getenv("FORCE_REUPLOAD", "false").strip().lower() == "true"
 
 _start_from_raw = os.getenv("START_FROM_DATE", "").strip()
 GLOBAL_START_FROM_DATE: date | None = (
@@ -1003,8 +1007,11 @@ def process_group_attendance(page, group_name: str, num_group: int):
             if already_taken:
                 # The LMS already has this session's attendance. It is only
                 # touched again when run_attendance.js rewrote the CSV since
-                # (the CSV is then listed in pending_reuploads.json).
-                if reupload_key not in PENDING_REUPLOADS:
+                # (the CSV is then listed in pending_reuploads.json), or when
+                # the re-upload option was ticked to correct attendance that
+                # was taken wrong.
+                is_pending = reupload_key in PENDING_REUPLOADS
+                if not is_pending and not FORCE_REUPLOAD:
                     print(f"⏭️ Attendance already taken and {csv_file} did not change since. Skip.")
                     skipped_done += 1
                     SESSION_LOG.append({
@@ -1014,9 +1021,14 @@ def process_group_attendance(page, group_name: str, num_group: int):
                     })
                     continue
 
-                changed_at = PENDING_REUPLOADS[reupload_key].get("updatedAt", "unknown time")
-                print(f"📄 Matched CSV: {csv_file} (changed {changed_at})")
-                print("♻️ Attendance already taken, but the CSV changed since. Opening Change attendance...")
+                if is_pending:
+                    changed_at = PENDING_REUPLOADS[reupload_key].get("updatedAt", "unknown time")
+                    print(f"📄 Matched CSV: {csv_file} (changed {changed_at})")
+                    print("♻️ Attendance already taken, but the CSV changed since. Opening Change attendance...")
+                else:
+                    print(f"📄 Matched CSV: {csv_file}")
+                    print("♻️ Attendance already taken; re-upload option is on, so it is uploaded again. "
+                          "Opening Change attendance...")
                 target_href = row["change_href"]
             else:
                 print(f"📄 Matched CSV: {csv_file}")
@@ -1180,6 +1192,11 @@ def run_profile(page, profile: dict):
 # MAIN
 # =========================
 def main():
+    if FORCE_REUPLOAD:
+        print(
+            "♻️ Re-upload option is ON: sessions that already have attendance on the LMS "
+            "will be uploaded again and their current attendance replaced."
+        )
     load_student_status()
     load_existing_missing_from_wavz()
     load_pending_reuploads()
