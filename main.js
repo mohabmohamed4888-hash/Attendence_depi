@@ -11,6 +11,8 @@ const { resolveGroupsWorkbookPath } = require('./group_workbook');
 let mainWindow;
 let currentProcess = null;
 let currentTaskId = null;
+let chainRunning = false;
+let chainCancelled = false;
 let logBuffer = [];
 let logBufferSize = 0;
 let groupsListCache = null;
@@ -118,159 +120,260 @@ app.on('activate', () => {
   }
 });
 
+/* Runs one step and resolves with its exit code. It does NOT send
+   'process-ended', so several steps can run one after another inside a single
+   run (see 'start-full-run') while the interface stays busy throughout. */
+function runStep(event, step) {
+  return new Promise((resolve) => {
+    const { taskId, label, command, args, options = {} } = step;
+    const cleanup = typeof options.cleanup === 'function' ? options.cleanup : null;
+    let settled = false;
+
+    currentTaskId = taskId;
+    event.reply('log', `[START] Starting ${label}...\n`);
+
+    const child = spawn(command, args, {
+      cwd: options.cwd || __dirname,
+      env: options.env || process.env,
+      windowsHide: true,
+    });
+    currentProcess = child;
+
+    const finish = (code, signal) => {
+      if (settled) return;
+      settled = true;
+
+      if (cleanup) {
+        try {
+          cleanup();
+        } catch (error) {
+          event.reply('log', `Warning: cleanup failed: ${error.message}\n`);
+        }
+      }
+
+      event.reply('log', `\n[OK] ${label} ended with code ${code}\n`);
+      if (currentProcess === child) {
+        currentProcess = null;
+        currentTaskId = null;
+      }
+      resolve({ code, signal });
+    };
+
+    child.stdout.on('data', (data) => {
+      const log = data.toString();
+      appendToLogBuffer(log);
+      event.reply('log', log);
+    });
+
+    child.stderr.on('data', (data) => {
+      const log = `ERROR: ${data.toString()}`;
+      appendToLogBuffer(log);
+      event.reply('log', log);
+    });
+
+    child.on('error', (error) => {
+      const log = `ERROR: Failed to start ${label}: ${error.message}\n`;
+      appendToLogBuffer(log);
+      event.reply('log', log);
+      // A process that never started emits 'error' and may never emit 'close'.
+      finish(-1, null);
+    });
+
+    child.on('close', (code, signal) => finish(code, signal));
+  });
+}
+
 function startManagedProcess(event, taskId, taskLabel, command, args, options = {}) {
-  if (currentProcess) {
+  if (currentProcess || chainRunning) {
     event.reply('log', '[WARN] Another process is already running.\n');
     return;
   }
 
-  const cleanup = typeof options.cleanup === 'function' ? options.cleanup : null;
   logBuffer = [];
   logBufferSize = 0;
-  currentTaskId = taskId;
-  event.reply('log', `[START] Starting ${taskLabel}...\n`);
+  runStep(event, { taskId, label: taskLabel, command, args, options }).then(
+    ({ code, signal }) => {
+      event.reply('process-ended', { code, signal, taskId });
+    }
+  );
+}
 
-  currentProcess = spawn(command, args, {
-    cwd: options.cwd || __dirname,
-    env: options.env || process.env,
-    windowsHide: true,
-  });
+/* =======================
+   STEP BUILDERS
+   The single buttons and the full run share these, so one flow can never
+   drift from the other.
+======================= */
 
-  currentProcess.stdout.on('data', (data) => {
-    const log = data.toString();
-    appendToLogBuffer(log);
-    event.reply('log', log);
-  });
+function attendanceStep(config) {
+  const configPath = path.join(__dirname, 'temp_config.json');
+  fs.writeFileSync(
+    configPath,
+    JSON.stringify({
+      dateFrom: config.dateFrom,
+      dateTo: config.dateTo,
+      groupFilter: config.groupFilter,
+      roundFilter: config.roundFilter,
+      batchFilter: config.batchFilter,
+      trackFilter: normalizeTrack(config.trackFilter),
+    })
+  );
 
-  currentProcess.stderr.on('data', (data) => {
-    const log = `ERROR: ${data.toString()}`;
-    appendToLogBuffer(log);
-    event.reply('log', log);
-  });
+  return {
+    taskId: 'attendance',
+    label: 'attendance automation',
+    command: 'node',
+    args: ['run_attendance.js', '--config', configPath],
+    options: {
+      cwd: __dirname,
+      cleanup: () => {
+        if (fs.existsSync(configPath)) fs.unlinkSync(configPath);
+      },
+    },
+  };
+}
 
-  currentProcess.on('error', (error) => {
-    const log = `ERROR: Failed to start ${taskLabel}: ${error.message}\n`;
-    appendToLogBuffer(log);
-    event.reply('log', log);
-  });
+function lmsEnv(config, extra = {}) {
+  return {
+    ...process.env,
+    ONLY_GROUPS: resolveOnlyGroups(config.groupFilter, config.batchFilter, config.trackFilter),
+    LMS_ROUND: config.roundFilter || '',
+    LMS_TRACK: normalizeTrack(config.trackFilter),
+    LMS_COURSE_MODULE_ID: '',
+    LMS_VIEW: config.lmsView || '4',
+    PYTHONIOENCODING: 'utf-8',
+    PYTHONUTF8: '1',
+    PYTHONUNBUFFERED: '1',
+    ...extra,
+  };
+}
 
-  currentProcess.on('close', (code, signal) => {
-    if (cleanup) {
+function lmsEditStep(config) {
+  return {
+    taskId: 'lms-edit',
+    label: 'LMS edit',
+    command: 'python',
+    args: ['-X', 'utf8', '-u', path.join('lms-bot', 'edit.py')],
+    options: { cwd: __dirname, env: lmsEnv(config) },
+  };
+}
+
+function lmsUploadStep(config) {
+  return {
+    taskId: 'lms-upload',
+    label: 'LMS upload',
+    command: 'python',
+    args: ['-X', 'utf8', '-u', path.join('lms-bot', 'upload.py')],
+    options: {
+      cwd: __dirname,
+      env: lmsEnv(config, { START_FROM_DATE: config.dateFrom || '' }),
+    },
+  };
+}
+
+ipcMain.on('start-attendance', (event, config) => {
+  const step = attendanceStep(config);
+  startManagedProcess(event, step.taskId, step.label, step.command, step.args, step.options);
+});
+
+ipcMain.on('start-lms-upload', (event, config) => {
+  const step = lmsUploadStep(config);
+  startManagedProcess(event, step.taskId, step.label, step.command, step.args, step.options);
+});
+
+ipcMain.on('start-lms-edit', (event, config) => {
+  const step = lmsEditStep(config);
+  startManagedProcess(event, step.taskId, step.label, step.command, step.args, step.options);
+});
+
+/* =======================
+   FULL RUN
+   Attendance -> Sync/Edit sessions -> Upload, back to back with no idle time
+   in between. The order is the one the data needs: the attendance export
+   writes the CSVs and the session titles, the sync makes sure every session
+   exists on the LMS, and only then is the attendance uploaded onto it.
+   A step that fails stops the run: uploading onto sessions that were never
+   synced would put attendance on the wrong rows.
+======================= */
+
+ipcMain.on('start-full-run', async (event, config) => {
+  if (currentProcess || chainRunning) {
+    event.reply('log', '[WARN] Another process is already running.\n');
+    return;
+  }
+
+  chainRunning = true;
+  chainCancelled = false;
+  logBuffer = [];
+  logBufferSize = 0;
+
+  const steps = [
+    { title: 'Attendance export', build: () => attendanceStep(config) },
+    { title: 'Sync / Edit sessions', build: () => lmsEditStep(config) },
+    { title: 'Upload attendance', build: () => lmsUploadStep(config) },
+  ];
+
+  let lastCode = 0;
+  const startedAt = Date.now();
+
+  try {
+    for (let i = 0; i < steps.length; i++) {
+      if (chainCancelled) break;
+
+      const { title, build } = steps[i];
+      event.reply('log', `\n${'='.repeat(70)}\n[FULL RUN] Step ${i + 1}/${steps.length}: ${title}\n${'='.repeat(70)}\n`);
+
+      let step;
       try {
-        cleanup();
+        step = build();
       } catch (error) {
-        event.reply('log', `Warning: cleanup failed: ${error.message}\n`);
+        event.reply('log', `\n[FULL RUN] Could not start ${title}: ${error.message}\n`);
+        lastCode = -1;
+        break;
+      }
+
+      const { code } = await runStep(event, step);
+      lastCode = code;
+
+      if (chainCancelled) {
+        event.reply('log', `\n[FULL RUN] Stopped by user after step ${i + 1}/${steps.length}.\n`);
+        break;
+      }
+
+      if (code !== 0) {
+        event.reply(
+          'log',
+          `\n[FULL RUN] Step ${i + 1}/${steps.length} (${title}) ended with code ${code}. ` +
+          `The remaining steps were not run — fix this one and start again.\n`
+        );
+        break;
       }
     }
 
-    event.reply('log', `\n[OK] ${taskLabel} ended with code ${code}\n`);
-    event.reply('process-ended', { code, signal, taskId });
-    currentProcess = null;
-    currentTaskId = null;
-  });
-}
+    if (!chainCancelled && lastCode === 0) {
+      const minutes = ((Date.now() - startedAt) / 60000).toFixed(1);
+      event.reply('log', `\n${'='.repeat(70)}\n[FULL RUN] All 3 steps finished in ${minutes} minutes.\n${'='.repeat(70)}\n`);
+    }
+  } finally {
+    chainRunning = false;
+    chainCancelled = false;
+    event.reply('process-ended', { code: lastCode, signal: null, taskId: 'full-run' });
+  }
+});
 
-ipcMain.on('start-attendance', (event, {
-  dateFrom,
-  dateTo,
-  groupFilter,
-  roundFilter,
-  batchFilter,
-  trackFilter,
-}) => {
-  const configPath = path.join(__dirname, 'temp_config.json');
-  const config = {
-    dateFrom,
-    dateTo,
-    groupFilter,
-    roundFilter,
-    batchFilter,
-    trackFilter: normalizeTrack(trackFilter),
-  };
-  fs.writeFileSync(configPath, JSON.stringify(config));
+/* =======================
+   CLEAN EXPORTS
+   Deletes the per-session attendance CSVs that are already on the LMS.
+   Runs only when the button is pressed (see exports_cleanup.js).
+======================= */
 
+ipcMain.on('clean-exports', (event) => {
   startManagedProcess(
     event,
-    'attendance',
-    'attendance automation',
+    'clean-exports',
+    'exports cleanup',
     'node',
-    ['run_attendance.js', '--config', configPath],
-    {
-      cwd: __dirname,
-      cleanup: () => {
-        if (fs.existsSync(configPath)) {
-          fs.unlinkSync(configPath);
-        }
-      },
-    }
-  );
-});
-
-ipcMain.on('start-lms-upload', (event, {
-  dateFrom,
-  groupFilter,
-  roundFilter,
-  batchFilter,
-  trackFilter,
-  lmsView,
-}) => {
-  const onlyGroups = resolveOnlyGroups(groupFilter, batchFilter, trackFilter);
-  const env = {
-    ...process.env,
-    START_FROM_DATE: dateFrom || '',
-    ONLY_GROUPS: onlyGroups,
-    LMS_ROUND: roundFilter || '',
-    LMS_TRACK: normalizeTrack(trackFilter),
-    LMS_COURSE_MODULE_ID: '',
-    LMS_VIEW: lmsView || '4',
-    PYTHONIOENCODING: 'utf-8',
-    PYTHONUTF8: '1',
-    PYTHONUNBUFFERED: '1',
-  };
-
-  startManagedProcess(
-    event,
-    'lms-upload',
-    'LMS upload',
-    'python',
-    ['-X', 'utf8', '-u', path.join('lms-bot', 'upload.py')],
-    {
-      cwd: __dirname,
-      env,
-    }
-  );
-});
-
-ipcMain.on('start-lms-edit', (event, {
-  groupFilter,
-  roundFilter,
-  batchFilter,
-  trackFilter,
-  lmsView,
-}) => {
-  const onlyGroups = resolveOnlyGroups(groupFilter, batchFilter, trackFilter);
-  const env = {
-    ...process.env,
-    ONLY_GROUPS: onlyGroups,
-    LMS_ROUND: roundFilter || '',
-    LMS_TRACK: normalizeTrack(trackFilter),
-    LMS_COURSE_MODULE_ID: '',
-    LMS_VIEW: lmsView || '4',
-    PYTHONIOENCODING: 'utf-8',
-    PYTHONUTF8: '1',
-    PYTHONUNBUFFERED: '1',
-  };
-
-  startManagedProcess(
-    event,
-    'lms-edit',
-    'LMS edit',
-    'python',
-    ['-X', 'utf8', '-u', path.join('lms-bot', 'edit.py')],
-    {
-      cwd: __dirname,
-      env,
-    }
+    ['exports_cleanup.js'],
+    { cwd: __dirname }
   );
 });
 
@@ -301,11 +404,12 @@ ipcMain.on('start-dashboard-link-edit', (event, {
 });
 
 ipcMain.on('stop-process', (event) => {
+  // Set first: a full run must not start its next step after this one is killed.
+  if (chainRunning) chainCancelled = true;
+
   if (currentProcess) {
     const stoppedTask = currentTaskId || 'process';
     currentProcess.kill();
-    currentProcess = null;
-    currentTaskId = null;
     event.reply('log', `\n[STOP] ${stoppedTask} stopped by user\n`);
   }
 });

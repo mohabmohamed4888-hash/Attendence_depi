@@ -218,6 +218,8 @@ function setActionButtonsRunning(running) {
   document.getElementById('uploadBtn').disabled = running;
   document.getElementById('editBtn').disabled = running;
   document.getElementById('dashboardLinkBtn').disabled = running;
+  document.getElementById('fullRunBtn').disabled = running;
+  document.getElementById('cleanExportsBtn').disabled = running;
 }
 
 function getFormValues(requireRound = false) {
@@ -334,6 +336,40 @@ function startProcess() {
 
   beginRun('attendance', 'Running Attendance');
   window.electron.startAttendance(formValues);
+}
+
+// Attendance -> Sync / Edit sessions -> Upload, one after the other with no
+// waiting in between. The main process stops the run if a step fails.
+function startFullRun() {
+  const formValues = getFormValues(true);
+  if (!formValues) return;
+
+  beginRun('full-run', 'Running Everything');
+  addLogEntry('Full run: Attendance -> Sync / Edit Sessions -> Upload Attendance', 'info');
+  window.electron.startFullRun(formValues);
+}
+
+// Deletes the session CSVs that are already on the LMS. Files waiting for a
+// re-upload are kept by the cleanup itself.
+function cleanExports() {
+  if (isRunning) {
+    addLogEntry('Wait for the running operation to finish first.', 'error');
+    return;
+  }
+
+  const confirmed = window.confirm(
+    'Delete the session CSV files in exports?\n\n' +
+    'Files still waiting for an LMS re-upload are kept, and so are the session titles and the reports.\n' +
+    'Anything deleted can be produced again by running the attendance export for those dates.\n\n' +
+    'This cannot be undone.'
+  );
+  if (!confirmed) {
+    addLogEntry('Exports cleanup cancelled.', 'info');
+    return;
+  }
+
+  beginRun('clean-exports', 'Cleaning Exports');
+  window.electron.cleanExports();
 }
 
 function startLmsUpload() {

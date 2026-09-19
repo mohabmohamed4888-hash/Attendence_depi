@@ -2,6 +2,8 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('electron', {
   startAttendance: (config) => ipcRenderer.send('start-attendance', config),
+  startFullRun: (config) => ipcRenderer.send('start-full-run', config),
+  cleanExports: () => ipcRenderer.send('clean-exports'),
   startLmsUpload: (config) => ipcRenderer.send('start-lms-upload', config),
   startLmsEdit: (config) => ipcRenderer.send('start-lms-edit', config),
   startDashboardLinkEdit: (config) => ipcRenderer.send('start-dashboard-link-edit', config),

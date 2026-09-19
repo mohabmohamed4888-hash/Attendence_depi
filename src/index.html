@@ -121,6 +121,9 @@
         </div>
 
         <div class="button-group">
+          <button id="fullRunBtn" class="btn btn-full-run" onclick="startFullRun()">
+            <span class="btn-icon">All</span> Run Everything
+          </button>
           <button id="startBtn" class="btn btn-primary" onclick="startProcess()">
             <span class="btn-icon">Attendance</span> Run Attendance
           </button>
@@ -136,10 +139,21 @@
           <button id="stopBtn" class="btn btn-danger" onclick="stopProcess()" disabled>
             <span class="btn-icon">Stop</span> Cancel
           </button>
+          <button id="cleanExportsBtn" class="btn btn-clean" onclick="cleanExports()">
+            <span class="btn-icon">Clean</span> Clean Exports
+          </button>
           <button id="clearBtn" class="btn btn-secondary" onclick="clearLogs()">
             <span class="btn-icon">Clear</span> Log
           </button>
         </div>
+        <small class="form-hint">
+          <strong>Run Everything</strong> does the three steps back to back with no waiting in between:
+          Run Attendance, then Sync / Edit Sessions, then Upload Attendance. A step that fails stops the run.
+          <br>
+          <strong>Clean Exports</strong> deletes the session CSVs that are already on the LMS. Files still
+          waiting for a re-upload are kept, and so are the session titles and the reports. It only runs when
+          you press it.
+        </small>
 
         <div class="status-box">
           <div class="status-item">

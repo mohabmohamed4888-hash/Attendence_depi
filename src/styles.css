@@ -580,6 +580,15 @@ body::after {
   box-shadow: 0 18px 28px -18px rgba(20, 184, 166, 0.78);
 }
 
+.btn-full-run {
+  background: linear-gradient(135deg, #10b981, #047857);
+  box-shadow: 0 18px 28px -18px rgba(4, 120, 87, 0.72);
+  grid-column: 1 / -1;
+}
+.btn-clean {
+  background: linear-gradient(135deg, #64748b, #334155);
+  box-shadow: 0 18px 28px -18px rgba(51, 65, 85, 0.72);
+}
 .btn-upload {
   background: linear-gradient(135deg, #0ea5e9, #2563eb);
   box-shadow: 0 18px 28px -18px rgba(37, 99, 235, 0.72);
