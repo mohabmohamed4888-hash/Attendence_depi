@@ -57,6 +57,11 @@ LMS_ROUND = os.getenv("LMS_ROUND", "").strip()
 MISSING_FROM_WAVZ_PATH = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "exports", "missing from wavz.csv")
 )
+EXPORTS_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "exports"))
+# Written by run_attendance.js whenever it rewrites a CSV with different content.
+# Sessions listed here are uploaded again even when the LMS already has attendance.
+PENDING_REUPLOADS_PATH = os.path.join(EXPORTS_ROOT, "pending_reuploads.json")
+PENDING_REUPLOADS: dict[str, dict] = {}
 
 with open(os.path.join(os.path.dirname(__file__), "round5_groups.json"), encoding="utf-8") as f:
     ROUND_5_GROUPS = {name: int(number) for name, number in json.load(f).items()}
@@ -311,11 +316,6 @@ def goto_table(page, target_url: str):
         raise RuntimeError(f"Attendance page did not load correctly: {page.url}")
 
 
-def get_session_rows(page):
-    rows = page.locator("table.generaltable tbody tr")
-    return rows, rows.count()
-
-
 def extract_date_from_row_text(txt: str):
     t = normalize_spaces(txt)
     t = re.sub(r"^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+", "", t, flags=re.I)
@@ -371,53 +371,6 @@ def session_type_to_filename_token(session_type: str):
         return mapping[t]
     parts = [p.capitalize() for p in normalize_token(t).split("_") if p]
     return "_".join(parts)
-
-
-def row_has_take_attendance(row) -> bool:
-    try:
-        loc = row.locator(
-            "xpath=.//a[contains(@href,'/mod/attendance/take.php') and (@aria-label='Take attendance' or @title='Take attendance' or .//i[contains(@class,'fa-play')])]"
-        ).first
-        return loc.count() > 0
-    except Exception:
-        return False
-
-
-def row_has_change_attendance(row) -> bool:
-    try:
-        loc = row.locator(
-            "xpath=.//a[contains(@href,'/mod/attendance/take.php') and (@aria-label='Change attendance' or @title='Change attendance' or .//img[contains(@src,'redo')])]"
-        ).first
-        return loc.count() > 0
-    except Exception:
-        return False
-
-
-def click_take_attendance_in_row(row):
-    loc = row.locator(
-        "xpath=.//a[contains(@href,'/mod/attendance/take.php') and (@aria-label='Take attendance' or @title='Take attendance' or .//i[contains(@class,'fa-play')])]"
-    ).first
-    loc.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
-    loc.scroll_into_view_if_needed()
-    loc.click()
-
-
-def debug_row_actions(row, row_no):
-    try:
-        links = row.locator("a").all()
-        print(f"🔎 Row {row_no} links count = {len(links)}")
-        for idx, a in enumerate(links, start=1):
-            try:
-                print(
-                    f"   link {idx}: "
-                    f"aria-label={a.get_attribute('aria-label')} | "
-                    f"title={a.get_attribute('title')} | "
-                    f"href={a.get_attribute('href')}"
-                )
-            except Exception:
-                pass
-    except Exception as e:
-        print(f"⚠️ debug_row_actions failed on row {row_no}: {e}")
 
 
 def get_csv_date_range_for_group(group_name: str) -> "tuple[date | None, date | None]":
@@ -498,7 +451,13 @@ def open_upload_section(page):
     upload_btn.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
     upload_btn.scroll_into_view_if_needed()
     upload_btn.click()
-    page.wait_for_timeout(700)
+    # The next step needs the "Choose a file" control: wait for it instead of a fixed pause.
+    try:
+        page.locator(
+            "input.fp-btn-choose[value*='Choose a file'], input[name='attendancefilechoose']"
+        ).first.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
+    except Exception:
+        page.wait_for_timeout(700)
     dismiss_popups(page)
 
 
@@ -519,7 +478,12 @@ def choose_file_in_modal(page, csv_path: str):
     upload_this_file_btn.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
     upload_this_file_btn.click()
 
-    page.wait_for_timeout(1200)
+    # The file picker closes once the file is stored in the form's draft area.
+    try:
+        upload_this_file_btn.wait_for(state="hidden", timeout=DEFAULT_TIMEOUT_MS)
+    except Exception:
+        page.wait_for_timeout(1200)
+    page.wait_for_timeout(300)
     dismiss_popups(page)
 
 
@@ -634,6 +598,46 @@ def write_missing_from_wavz():
         )
 
 
+# =========================
+# PENDING RE-UPLOADS
+# run_attendance.js lists every CSV it rewrote with different content in
+# exports/pending_reuploads.json. Those sessions are uploaded again even when
+# the LMS already has attendance for them, then removed from the list.
+# =========================
+def pending_reupload_key(csv_path: str) -> str:
+    return os.path.relpath(os.path.abspath(csv_path), EXPORTS_ROOT).replace("\\", "/")
+
+
+def load_pending_reuploads():
+    PENDING_REUPLOADS.clear()
+    if not os.path.isfile(PENDING_REUPLOADS_PATH):
+        return
+    try:
+        with open(PENDING_REUPLOADS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            for key, info in data.items():
+                PENDING_REUPLOADS[str(key)] = info if isinstance(info, dict) else {}
+    except Exception as e:
+        print(f"⚠️ Could not read {os.path.basename(PENDING_REUPLOADS_PATH)}: {e}")
+        return
+    if PENDING_REUPLOADS:
+        print(f"♻️ {len(PENDING_REUPLOADS)} updated CSV(s) are waiting to be re-uploaded:")
+        for key, info in sorted(PENDING_REUPLOADS.items()):
+            print(f"   - {key} (changed {info.get('updatedAt', 'unknown time')})")
+
+
+def save_pending_reuploads():
+    try:
+        if PENDING_REUPLOADS:
+            with open(PENDING_REUPLOADS_PATH, "w", encoding="utf-8") as f:
+                json.dump(PENDING_REUPLOADS, f, ensure_ascii=False, indent=2)
+        elif os.path.isfile(PENDING_REUPLOADS_PATH):
+            os.remove(PENDING_REUPLOADS_PATH)
+    except Exception as e:
+        print(f"⚠️ Could not save {os.path.basename(PENDING_REUPLOADS_PATH)}: {e}")
+
+
 def collect_missing_from_wavz(page, group_name: str, csv_path: str) -> int:
     alert_texts = page.locator(".alert, [role='alert']").all_inner_texts()
     missing_emails: set[str] = set()
@@ -733,12 +737,9 @@ def write_report():
 # =========================
 # DATE HELPERS
 # =========================
-def find_start_index_by_date(rows, n: int, start_from: date) -> int:
-    dates = []
-    for i in range(n):
-        txt = normalize_spaces(rows.nth(i).inner_text())
-        dates.append(extract_date_from_row_text(txt))
-
+def find_start_index_by_dates(dates: list, start_from: date) -> int:
+    """First index whose date is on/after start_from (rows are in date order)."""
+    n = len(dates)
     lo, hi = 0, n
     while lo < hi:
         mid = (lo + hi) // 2
@@ -803,16 +804,24 @@ def process_group_attendance(page, group_name: str, num_group: int):
     if end_at:
         print(f"📅 END_AT_DATE (auto from CSVs): {end_at.isoformat()}")
 
+    group_started = datetime.now()
+
+    # One page load and one read of the whole table per group. Every decision
+    # below is taken on this snapshot, and each upload opens the row's own
+    # take.php link directly, so the table is not reloaded between rows.
     goto_table(page, target_url)
-    rows, n = get_session_rows(page)
+    snapshot = lms_session.parse_sessions_table(page)
+    n = len(snapshot)
     print(f"📌 Visible rows: {n}")
 
     if n == 0:
         print("⚠️  No session rows on page. Nothing to do.")
         return
 
+    dates = [extract_date_from_row_text(row["text"]) for row in snapshot]
+
     if start_from:
-        start_index = find_start_index_by_date(rows, n, start_from)
+        start_index = find_start_index_by_dates(dates, start_from)
         if start_index >= n:
             print(f"⚠️  No rows found on or after {start_from.isoformat()}. Nothing to do.")
             return
@@ -821,30 +830,26 @@ def process_group_attendance(page, group_name: str, num_group: int):
         start_index = 0
 
     uploaded = 0
+    reuploaded = 0
     skipped_done = 0
     skipped_unknown = 0
     failed = 0
+    to_verify = []
 
     for i in range(start_index, n):
         row_date = None
         session_type = "unknown"
         csv_file = ""
         try:
-            goto_table(page, target_url)
-            rows, current_n = get_session_rows(page)
-            if i >= current_n:
-                break
-
-            row = rows.nth(i)
-            row_text = normalize_spaces(row.inner_text())
+            row = snapshot[i]
+            row_text = row["text"]
             if not row_text:
                 continue
 
             print("\n" + "-" * 80)
             print(f"🎯 Row {i + 1}: {row_text[:220]}")
-            debug_row_actions(row, i + 1)
 
-            row_date = extract_date_from_row_text(row_text)
+            row_date = dates[i]
             row_session_type = extract_session_type_from_title(
                 extract_session_title_from_row_text(row_text))
 
@@ -852,18 +857,8 @@ def process_group_attendance(page, group_name: str, num_group: int):
                 print(f"⏹️  Row date {row_date.isoformat()} > last CSV date {end_at.isoformat()}. Done with this group.")
                 break
 
-            if row_has_change_attendance(row):
-                print("⏭️ Attendance already taken. Skip.")
-                skipped_done += 1
-                SESSION_LOG.append({
-                    "profile": profile_name, "group": group_name,
-                    "date": row_date.isoformat() if row_date else "unknown",
-                    "session_type": row_session_type,
-                    "status": "skipped_already_taken", "csv_file": "", "reason": "",
-                })
-                continue
-
-            if not row_has_take_attendance(row):
+            already_taken = row["attendance_taken"]
+            if not already_taken and not row["take_href"]:
                 print("⏭️ No Take attendance action found. Skip.")
                 skipped_unknown += 1
                 SESSION_LOG.append({
@@ -875,6 +870,15 @@ def process_group_attendance(page, group_name: str, num_group: int):
                 continue
 
             if not row_date:
+                if already_taken:
+                    print("⏭️ Attendance already taken. Skip.")
+                    skipped_done += 1
+                    SESSION_LOG.append({
+                        "profile": profile_name, "group": group_name,
+                        "date": "unknown", "session_type": row_session_type,
+                        "status": "skipped_already_taken", "csv_file": "", "reason": "",
+                    })
+                    continue
                 raise RuntimeError("Could not parse row date")
 
             row_group = extract_group_from_row_text(row_text) or group_name
@@ -889,6 +893,15 @@ def process_group_attendance(page, group_name: str, num_group: int):
                 csv_path = find_csv_for_session(row_group, row_date, session_type)
                 csv_file = os.path.basename(csv_path)
             except RuntimeError as csv_err:
+                if already_taken:
+                    print("⏭️ Attendance already taken and there is no CSV to re-upload. Skip.")
+                    skipped_done += 1
+                    SESSION_LOG.append({
+                        "profile": profile_name, "group": group_name,
+                        "date": row_date.isoformat(), "session_type": session_type,
+                        "status": "skipped_already_taken", "csv_file": "", "reason": "",
+                    })
+                    continue
                 print(f"⚠️  CSV not found: {csv_err}")
                 skipped_unknown += 1
                 SESSION_LOG.append({
@@ -898,21 +911,59 @@ def process_group_attendance(page, group_name: str, num_group: int):
                 })
                 continue
 
-            print(f"📄 Matched CSV: {csv_file}")
-            print("▶️ Opening Take attendance...")
-            click_take_attendance_in_row(row)
+            reupload_key = pending_reupload_key(csv_path)
+            if already_taken:
+                # The LMS already has this session's attendance. It is only
+                # touched again when run_attendance.js rewrote the CSV since
+                # (the CSV is then listed in pending_reuploads.json).
+                if reupload_key not in PENDING_REUPLOADS:
+                    print(f"⏭️ Attendance already taken and {csv_file} did not change since. Skip.")
+                    skipped_done += 1
+                    SESSION_LOG.append({
+                        "profile": profile_name, "group": group_name,
+                        "date": row_date.isoformat(), "session_type": session_type,
+                        "status": "skipped_already_taken", "csv_file": csv_file, "reason": "",
+                    })
+                    continue
+
+                changed_at = PENDING_REUPLOADS[reupload_key].get("updatedAt", "unknown time")
+                print(f"📄 Matched CSV: {csv_file} (changed {changed_at})")
+                print("♻️ Attendance already taken, but the CSV changed since. Opening Change attendance...")
+                target_href = row["change_href"]
+            else:
+                print(f"📄 Matched CSV: {csv_file}")
+                print("▶️ Opening Take attendance...")
+                target_href = row["take_href"]
+
+            # Same page the row icon opens (take.php?...&sessionid=...).
+            page.goto(target_href)
             wait_dom_ready(page)
             dismiss_popups(page)
 
             upload_attendance_csv_for_current_session(page, csv_path, row_group)
 
             if not DRY_RUN:
-                uploaded += 1
-                print("✅ Attendance uploaded successfully.")
+                if already_taken:
+                    reuploaded += 1
+                    print("✅ Attendance re-uploaded successfully.")
+                else:
+                    uploaded += 1
+                    print("✅ Attendance uploaded successfully.")
+                pending_info = PENDING_REUPLOADS.pop(reupload_key, None)
+                if pending_info is not None:
+                    save_pending_reuploads()
                 SESSION_LOG.append({
                     "profile": profile_name, "group": group_name,
                     "date": row_date.isoformat(), "session_type": session_type,
-                    "status": "uploaded", "csv_file": csv_file, "reason": "",
+                    "status": "reuploaded" if already_taken else "uploaded",
+                    "csv_file": csv_file, "reason": "",
+                })
+                to_verify.append({
+                    "session_id": row["session_id"],
+                    "label": f"{row_date.isoformat()} | {session_type}",
+                    "csv_file": csv_file,
+                    "log_index": len(SESSION_LOG) - 1,
+                    "pending": (reupload_key, pending_info),
                 })
             else:
                 print("🧪 DRY_RUN completed for this session.")
@@ -934,12 +985,61 @@ def process_group_attendance(page, group_name: str, num_group: int):
                 "status": "failed", "csv_file": csv_file, "reason": str(e),
             })
 
+    verified, verify_failed = verify_uploads(page, target_url, to_verify)
+
     print("\n" + "#" * 90)
     print(
-        f"✅ DONE GROUP: {group_name} | uploaded={uploaded} | "
-        f"skipped_done={skipped_done} | skipped_unknown={skipped_unknown} | failed={failed}"
+        f"✅ DONE GROUP: {group_name} | uploaded={uploaded} | reuploaded={reuploaded} | "
+        f"verified={verified} | verify_failed={verify_failed} | "
+        f"skipped_done={skipped_done} | skipped_unknown={skipped_unknown} | failed={failed} "
+        f"| {(datetime.now() - group_started).total_seconds():.1f}s"
     )
     print("#" * 90)
+
+
+def verify_uploads(page, target_url: str, to_verify: list) -> "tuple[int, int]":
+    """Reloads the group's table once and checks that every session uploaded in
+    this run now shows attendance as taken. A miss is reported as verify_failed
+    and, for a CSV that was pending re-upload, the CSV goes back on the list."""
+    if not to_verify:
+        return 0, 0
+
+    print(f"\n🔍 Verifying {len(to_verify)} uploaded session(s) on the sessions table...")
+    try:
+        goto_table(page, target_url)
+        after = {
+            row["session_id"]: row
+            for row in lms_session.parse_sessions_table(page)
+            if row["session_id"]
+        }
+    except Exception as e:
+        print(f"⚠️ Could not reload the table to verify the uploads: {e}")
+        return 0, 0
+
+    verified = 0
+    verify_failed = 0
+    for item in to_verify:
+        row = after.get(item["session_id"])
+        if row and row["attendance_taken"]:
+            verified += 1
+            continue
+
+        verify_failed += 1
+        print(
+            f"❌ Verification failed: {item['label']} ({item['csv_file']}) does not show "
+            "attendance as taken. Check it on the LMS."
+        )
+        entry = SESSION_LOG[item["log_index"]]
+        entry["status"] = "verify_failed"
+        entry["reason"] = "attendance not shown as taken after the upload"
+        key, info = item["pending"]
+        if info is not None:
+            PENDING_REUPLOADS[key] = info
+            save_pending_reuploads()
+
+    if not verify_failed:
+        print(f"✅ Verified: all {verified} uploaded session(s) show attendance as taken.")
+    return verified, verify_failed
 
 
 # =========================
@@ -993,6 +1093,7 @@ def run_profile(page, profile: dict):
 # =========================
 def main():
     load_existing_missing_from_wavz()
+    load_pending_reuploads()
 
     print(f"🎛️ Track: {lms_session.track_label(LMS_TRACK)}")
     if not SELECTED_PROFILES:
@@ -1041,6 +1142,14 @@ def main():
             print(f"⚠️ Final missing-from-Wavz report save failed: {e}")
 
     write_report()
+
+    if PENDING_REUPLOADS:
+        print(
+            f"\n♻️ Still waiting for re-upload ({len(PENDING_REUPLOADS)}): not reached in this run "
+            "(outside the selected groups/dates), failed, or DRY_RUN. They stay listed for the next run:"
+        )
+        for key, info in sorted(PENDING_REUPLOADS.items()):
+            print(f"   - {key} (changed {info.get('updatedAt', 'unknown time')})")
 
 
 if __name__ == "__main__":

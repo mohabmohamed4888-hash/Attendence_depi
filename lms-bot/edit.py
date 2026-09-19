@@ -43,6 +43,8 @@ SHORT_TIMEOUT_MS = int(os.getenv("SHORT_TIMEOUT_MS", "6000"))
 INTER_SESSION_PAUSE_MS = int(os.getenv("INTER_SESSION_PAUSE_MS", "1500"))
 
 DEBUG = os.getenv("DEBUG", "1").strip().lower() not in {"0", "false", "no"}
+# DRY_RUN=true prints what would be edited or created without touching the LMS.
+DRY_RUN = os.getenv("DRY_RUN", "false").strip().lower() == "true"
 ONLY_GROUPS = parse_only_groups(os.getenv("ONLY_GROUPS", ""))
 LMS_ROUND = os.getenv("LMS_ROUND", "").strip()
 
@@ -660,9 +662,20 @@ def extract_date_from_row_text(txt: str):
 
 
 def extract_title_from_row_text(row_text: str) -> str:
+    # A row reads "Fri 17 July 2026 2PM - 5PM Group: CAI5_AIS4_S7 <description>":
+    # the description is what the CSV title is compared with, so the date, the
+    # time and the group cell are all stripped, not only the date.
     txt = " ".join((row_text or "").split())
-    txt = re.sub(r"^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+", "", txt, flags=re.I)
-    txt = re.sub(r"^\d{1,2}\s+[A-Za-z]{3,9}\.?\s+\d{4}\s*", "", txt, flags=re.I)
+    m = re.search(r"Group:\s*[A-Za-z0-9_]+\s+(.*)$", txt, flags=re.I)
+    if m:
+        txt = m.group(1)
+    else:
+        txt = re.sub(r"^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+", "", txt, flags=re.I)
+        txt = re.sub(r"^\d{1,2}\s+[A-Za-z]{3,9}\.?\s+\d{4}\s*", "", txt, flags=re.I)
+        txt = re.sub(
+            r"^\d{1,2}(?::\d{2})?\s*[AP]M\s*-\s*\d{1,2}(?::\d{2})?\s*[AP]M\s*", "", txt, flags=re.I
+        )
+        txt = re.sub(r"^(All students|Common session)\s*", "", txt, flags=re.I)
     junk_patterns = [
         r"Edit Session", r"Delete", r"Delete Session",
         r"Change attendance", r"Take attendance", r"Actions",
@@ -692,17 +705,34 @@ def find_exact_match(lms_sessions, target_date, csv_title, start24, end24):
     return None
 
 
-def find_edit_candidate(lms_sessions, target_date, start24, end24):
+def choose_lms_session(lms_sessions, target_date, start24, end24, claimed):
+    """Picks the LMS session a CSV row should edit.
+
+    Returns (session, how) with how one of:
+      "time"     same date and time, not yet paired with another CSV row
+      "conflict" same date and time, but already paired with another CSV row
+                 in this run (nothing is edited or created for such a row)
+      "date"     same date only, not yet paired (the time is corrected by the edit)
+      "none"     nothing on that date is free: the session has to be created
+    A session paired with one CSV row (matched, edited or created) is never
+    handed to a second row, so two sessions on the same day stay two sessions.
+    """
+    same_time_claimed = None
     for s in lms_sessions:
         if s["date_obj"] != target_date:
             continue
         lms_start, lms_end = extract_time_range_from_text(s.get("row_text", ""))
         if lms_start == start24 and lms_end == end24:
-            return s
+            if s["key"] in claimed:
+                same_time_claimed = same_time_claimed or s
+                continue
+            return s, "time"
+    if same_time_claimed:
+        return same_time_claimed, "conflict"
     for s in lms_sessions:
-        if s["date_obj"] == target_date:
-            return s
-    return None
+        if s["date_obj"] == target_date and s["key"] not in claimed:
+            return s, "date"
+    return None, "none"
 
 
 def group_round(group_name: str) -> str:
@@ -751,17 +781,10 @@ def goto_table(page, target_url: str):
 
 
 def build_lms_sessions(page):
-    table = page.locator("table.generaltable")
-    if table.count() == 0:
-        return []
-
-    rows = page.locator("table.generaltable tbody tr")
-    n = rows.count()
+    # The whole table is read in one page call (see lms_session.parse_sessions_table).
     out = []
-
-    for i in range(n):
-        row = rows.nth(i)
-        txt = " ".join(row.inner_text().split())
+    for row in lms_session.parse_sessions_table(page):
+        txt = " ".join(row["text"].split())
         lowered = txt.lower()
 
         if not txt:
@@ -775,11 +798,17 @@ def build_lms_sessions(page):
 
         title = extract_title_from_row_text(txt)
         out.append({
-            "idx_1based": i + 1,
+            "idx_1based": row["index"] + 1,
             "date_obj": d,
             "title": title,
             "title_norm": normalize_text(title),
             "row_text": txt[:500],
+            "attendance_taken": row["attendance_taken"],
+            "session_id": row["session_id"],
+            "edit_href": row["edit_href"],
+            # Stable identity across table reloads (row numbers shift when a
+            # session is created); the text fallback is for rows without links.
+            "key": row["session_id"] or f"row:{row['index']}:{txt[:120]}",
         })
 
     dbg(f"build_lms_sessions -> parsed_rows={len(out)}")
@@ -813,6 +842,22 @@ def click_edit_by_index(page, idx_1based: int):
 
     page.get_by_role("button", name=re.compile("save changes", re.I)).wait_for(timeout=DEFAULT_TIMEOUT_MS)
     dismiss_popups(page)
+
+
+def open_edit_form(page, candidate: dict, target_url: str):
+    """Opens one session's edit form through its own link (sessionid in the
+    URL), so the right session is edited even when row numbers shifted."""
+    href = candidate.get("edit_href")
+    if href:
+        page.goto(href)
+        wait_dom_ready(page)
+        dismiss_popups(page)
+        page.get_by_role("button", name=re.compile("save changes", re.I)).wait_for(timeout=DEFAULT_TIMEOUT_MS)
+        return
+
+    # No edit link was captured for this row: fall back to the table icon.
+    goto_table(page, target_url)
+    click_edit_by_index(page, candidate["idx_1based"])
 
 
 # =========================
@@ -1088,6 +1133,31 @@ def print_unmatched_report(unmatched):
 # =========================
 # PROCESS ONE FILE
 # =========================
+def verify_after_change(page, target_url, action, target_date, csv_title, start24, end24,
+                        claimed, unmatched, csv_path, csv_idx, item, stats):
+    """Reloads the table after an edit/creation and checks the session is there
+    with the expected date, time and title. Returns the fresh session list."""
+    goto_table(page, target_url)
+    sessions = build_lms_sessions(page)
+
+    found = find_exact_match(sessions, target_date, csv_title, start24, end24)
+    if found:
+        claimed.add(found["key"])
+        stats["edited" if action == "edit" else "created"] += 1
+        print(f"✅ Verified on LMS row {found['idx_1based']}: session {'edited' if action == 'edit' else 'created'}.")
+    else:
+        stats["failed"] += 1
+        print(
+            f"❌ Verification failed: no LMS session with date {target_date.isoformat()}, "
+            f"time {start24}-{end24} and this title after the {action}."
+        )
+        mark_unmatched(
+            unmatched, csv_path, csv_idx, item,
+            f"verification failed after {action}: session not found with the expected date/time/title",
+        )
+    return sessions
+
+
 def process_one_csv(page, csv_path: str, unmatched):
     GROUP_TO_NUM = _p("GROUP_TO_NUM")
 
@@ -1123,6 +1193,19 @@ def process_one_csv(page, csv_path: str, unmatched):
     except Exception as e:
         raise RuntimeError(f"Failed building target dates from CSV: {e}")
 
+    group_started = datetime.now()
+
+    # One page load and one read of the whole table per group; every CSV row
+    # is compared against this list. The table is read again only after an
+    # edit or a creation, to verify it and to keep the list current.
+    goto_table(page, target_url)
+    lms_sessions = build_lms_sessions(page)
+    print(f"📌 LMS visible REAL session rows: {len(lms_sessions)}")
+
+    claimed = set()  # LMS sessions already paired with a CSV row in this run
+    planned_creates = set()  # DRY_RUN only: creations that a real run would have done by now
+    stats = {"correct": 0, "same_title": 0, "taken": 0, "conflict": 0, "edited": 0, "created": 0, "failed": 0}
+
     for csv_idx, item in enumerate(rows_csv, start=1):
         try:
             csv_title = item.get("title", "").strip()
@@ -1130,48 +1213,89 @@ def process_one_csv(page, csv_path: str, unmatched):
 
             start24, end24 = extract_time_range_from_title(csv_title)
             if not start24 or not end24:
+                stats["failed"] += 1
                 mark_unmatched(unmatched, csv_path, csv_idx, item, "could not parse time from title")
                 continue
 
-            goto_table(page, target_url)
-            lms_sessions = build_lms_sessions(page)
+            planned_key = (target_date, start24, end24, normalize_text(csv_title))
+            exact = find_exact_match(lms_sessions, target_date, csv_title, start24, end24)
+            if exact or planned_key in planned_creates:
+                if exact:
+                    claimed.add(exact["key"])
+                stats["correct"] += 1
+                where = f"LMS row {exact['idx_1based']}" if exact else "a session planned above (DRY_RUN)"
+                dbg(
+                    f"[{group_name}] CSV row {csv_idx}: already correct at {where} "
+                    f"| {target_date.isoformat()} | {start24}-{end24}"
+                )
+                continue
 
             print("\n" + "-" * 80)
             print(f"[{group_name}] CSV row {csv_idx}/{len(rows_csv)}")
             print(f"🎯 target_date: {target_date.isoformat()}")
             print(f"📝 csv_title: {csv_title[:140]}")
             print(f"⏰ time: {start24} -> {end24}")
-            print(f"📌 LMS visible REAL session rows: {len(lms_sessions)}")
 
-            exact = find_exact_match(lms_sessions, target_date, csv_title, start24, end24)
-            if exact:
+            candidate, how = choose_lms_session(lms_sessions, target_date, start24, end24, claimed)
+            if how == "conflict":
+                stats["conflict"] += 1
                 print(
-                    f"⏭️ Session already correct on LMS at row {exact['idx_1based']} "
-                    f"| date={target_date.isoformat()} | time={start24}-{end24}"
+                    f"⚠️ LMS row {candidate['idx_1based']} at this date/time is already paired with "
+                    f"another CSV row -> nothing changed (check the titles CSV for a stale row)"
+                )
+                mark_unmatched(
+                    unmatched, csv_path, csv_idx, item,
+                    "another CSV row already matched the LMS session at this date/time; nothing changed",
                 )
                 continue
 
-            candidate = find_edit_candidate(lms_sessions, target_date, start24, end24)
             if candidate:
+                claimed.add(candidate["key"])
                 if candidate["title_norm"] == normalize_text(csv_title):
+                    stats["same_title"] += 1
                     print(f"⏭️ Same title already exists on LMS row {candidate['idx_1based']} -> skip edit")
+                    continue
+
+                # A session that already has attendance (the green "Change
+                # attendance" arrow) is left exactly as it is.
+                if candidate.get("attendance_taken"):
+                    stats["taken"] += 1
+                    print(
+                        f"⏭️ Attendance already taken on LMS row {candidate['idx_1based']} "
+                        f"| current='{candidate.get('title', '')[:100]}' -> edit skipped"
+                    )
+                    mark_unmatched(unmatched, csv_path, csv_idx, item, "attendance already taken on LMS; edit skipped")
                     continue
 
                 print(
                     f"✏️ Found editable session on LMS row {candidate['idx_1based']} "
                     f"| current='{candidate.get('title', '')[:100]}'"
                 )
-                click_edit_by_index(page, candidate["idx_1based"])
+                if DRY_RUN:
+                    print("🧪 DRY_RUN: this session would be edited.")
+                    stats["edited"] += 1
+                    continue
+
+                open_edit_form(page, candidate, target_url)
                 set_description_tinymce(page, csv_title)
                 set_date_dropdowns(page, target_date)
                 set_time_dropdowns(page, start24, end24)
 
                 print("💾 Saving edit...")
                 save_changes(page)
-                print("✅ Edited existing session.")
+                lms_sessions = verify_after_change(
+                    page, target_url, "edit", target_date, csv_title, start24, end24,
+                    claimed, unmatched, csv_path, csv_idx, item, stats,
+                )
                 page.wait_for_timeout(INTER_SESSION_PAUSE_MS)
             else:
                 print(f"➕ Session not found on LMS. Creating one | date={target_date.isoformat()} | time={start24}-{end24}")
+                if DRY_RUN:
+                    print("🧪 DRY_RUN: this session would be created.")
+                    stats["created"] += 1
+                    planned_creates.add(planned_key)
+                    continue
+
                 add_one_session_with_retry(
                     page=page,
                     target_url=target_url,
@@ -1182,15 +1306,39 @@ def process_one_csv(page, csv_path: str, unmatched):
                     end24=end24,
                     retries=2,
                 )
-                print("✅ Created.")
+                lms_sessions = verify_after_change(
+                    page, target_url, "create", target_date, csv_title, start24, end24,
+                    claimed, unmatched, csv_path, csv_idx, item, stats,
+                )
                 page.wait_for_timeout(INTER_SESSION_PAUSE_MS)
 
         except Exception as e:
+            stats["failed"] += 1
             print(f"❌ Failed on CSV row {csv_idx}: {e}")
             mark_unmatched(unmatched, csv_path, csv_idx, item, f"sync failed: {e}")
+            # The page may be anywhere after a failure: reload the table so the
+            # next CSV rows are compared with what is really on the LMS.
+            try:
+                goto_table(page, target_url)
+                lms_sessions = build_lms_sessions(page)
+            except Exception as reload_error:
+                print(f"❌ Could not reload the sessions table, stopping this group: {reload_error}")
+                for later_idx in range(csv_idx + 1, len(rows_csv) + 1):
+                    mark_unmatched(
+                        unmatched, csv_path, later_idx, rows_csv[later_idx - 1],
+                        "not checked: the sessions table could not be reloaded",
+                    )
+                break
 
     print("\n" + "#" * 90)
-    print(f"✅ DONE GROUP: {group_name}")
+    print(
+        f"✅ DONE GROUP: {group_name} | already correct={stats['correct']} | same title={stats['same_title']} | "
+        f"edited={stats['edited']} | created={stats['created']} | "
+        f"skipped (attendance taken)={stats['taken']} | conflicts={stats['conflict']} | failed={stats['failed']} "
+        f"| {(datetime.now() - group_started).total_seconds():.1f}s"
+    )
+    if DRY_RUN and (stats["edited"] or stats["created"]):
+        print("🧪 DRY_RUN: nothing was changed on the LMS.")
     print("#" * 90)
 
 

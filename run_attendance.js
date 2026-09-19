@@ -14,6 +14,13 @@ const {
   TRACK_NON_TECHNICAL,
 } = require('./group_tracks');
 const { resolveGroupsWorkbookPath } = require('./group_workbook');
+const {
+  MISSING_NAMES_FILE,
+  normalize,
+  parseCsvRows,
+  parseRosterEmails,
+  syncMissingStudents,
+} = require('./group_roster_sync');
 
 /* =======================
    SETTINGS
@@ -75,14 +82,6 @@ const ATTENDANCE_CONCURRENCY = 5;
 /* =======================
    HELPERS
 ======================= */
-
-const normalize = (s) =>
-  String(s || '')
-    .toLowerCase()
-    .replace(/[’']/g, '')
-    .replace(/[^\p{L}\p{N}]+/gu, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
 
 const safe = (s) => String(s || 'UNKNOWN').replace(/[^\w]+/g, '_');
 
@@ -321,9 +320,10 @@ async function appendFinishedTitleToGroup(group, sessionUrl, title) {
 
     if (fs.existsSync(filePath)) {
       try {
-        const existingWb = XLSX.readFile(filePath);
-        const sheet = existingWb.Sheets[existingWb.SheetNames[0]];
-        const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+        // Not SheetJS: it guesses "|" as the separator of these files (the
+        // titles are full of pipes) and then no existing row is recognised,
+        // so every run appended the same sessions again.
+        const rows = parseCsvRows(fs.readFileSync(filePath, 'utf-8'));
 
         for (const row of rows) {
           const url = String(row.sessionUrl || row.SessionURL || row.url || '').trim();
@@ -366,69 +366,6 @@ async function appendFinishedTitleToGroup(group, sessionUrl, title) {
 
   await writeFileWithRetry(filePath, csvContent);
   console.log(`♻️ Updated existing finished title for ${group}: ${sessionUrl}`);
-}
-
-/* =======================
-   LMS missing names CSV
-======================= */
-
-async function writeLmsMissingNamesCsv(missingNames, outDir) {
-  if (!missingNames || missingNames.length === 0) return null;
-
-  const outPath = path.join(outDir, 'Lms missing names.csv');
-  const byNameAndGroup = new Map();
-
-  if (fs.existsSync(outPath)) {
-    try {
-      const existingWb = XLSX.readFile(outPath);
-      const existingRows = XLSX.utils.sheet_to_json(
-        existingWb.Sheets[existingWb.SheetNames[0]]
-      );
-      for (const row of existingRows) {
-        const normalized = {
-          name: String(row.name || row.Name || '').trim(),
-          email: String(row.email || row.Email || '').trim(),
-          group: String(row.group || row.Group || '').trim(),
-        };
-        if (!normalized.name) continue;
-        const key = `${normalize(normalized.name)}||${normalize(normalized.group)}`;
-        byNameAndGroup.set(key, normalized);
-      }
-    } catch (error) {
-      console.log(`⚠️ Could not read existing Lms missing names.csv: ${error.message}`);
-    }
-  }
-
-  for (const item of missingNames) {
-    const obj = typeof item === 'string'
-      ? { name: item, email: '', group: '' }
-      : item;
-    const normalized = {
-      name: String(obj.name || '').trim(),
-      email: String(obj.email || '').trim(),
-      group: String(obj.group || '').trim(),
-    };
-    if (!normalized.name) continue;
-
-    const key = `${normalize(normalized.name)}||${normalize(normalized.group)}`;
-    const existing = byNameAndGroup.get(key);
-    if (!existing || (!existing.email && normalized.email)) {
-      byNameAndGroup.set(key, normalized);
-    }
-  }
-
-  const rows = [...byNameAndGroup.values()].sort((a, b) =>
-    a.group.localeCompare(b.group) || a.name.localeCompare(b.name)
-  );
-  const csvContent = '\ufeff' + [
-    ['name', 'email', 'group'],
-    ...rows.map((row) => [row.name, row.email, row.group]),
-  ]
-    .map((columns) => columns.map(csvEscape).join(','))
-    .join('\r\n');
-
-  await writeFileWithRetry(outPath, csvContent);
-  return outPath;
 }
 
 /* =======================
@@ -476,6 +413,32 @@ function writeSkippedExcel(skipped, outDir, dateFrom, dateTo) {
   XLSX.writeFile(wb, outPath);
 
   return outPath;
+}
+
+/* =======================
+   CSVs that changed after they were uploaded
+   exports/pending_reuploads.json lists attendance CSVs that were rewritten
+   with different content (attendance changed on the dashboard, or students
+   were added to the roster). lms-bot/upload.py re-uploads those sessions even
+   when the LMS already has attendance for them, then drops them from the list.
+======================= */
+
+const PENDING_REUPLOADS_FILE = path.join(EXPORT_DIR, 'pending_reuploads.json');
+
+function readPendingReuploads() {
+  if (!fs.existsSync(PENDING_REUPLOADS_FILE)) return {};
+  try {
+    const parsed = JSON.parse(fs.readFileSync(PENDING_REUPLOADS_FILE, 'utf-8'));
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+  } catch (error) {
+    console.log(`⚠️ Could not read ${PENDING_REUPLOADS_FILE}: ${error.message}`);
+  }
+  return {};
+}
+
+// Same key upload.py builds: the CSV path relative to exports/, with slashes.
+function pendingReuploadKey(csvPath) {
+  return path.relative(EXPORT_DIR, csvPath).split(path.sep).join('/');
 }
 
 /* =======================
@@ -660,21 +623,12 @@ async function fetchAttendanceRecords(api, session) {
    ATTENDANCE CSV
 ======================= */
 
-const EMAIL_REGEX = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
-
-function parseRosterEmails(rosterText) {
-  const emails = new Set();
-  for (const line of String(rosterText || '').split(/\r?\n/)) {
-    const match = line.match(EMAIL_REGEX);
-    if (match) emails.add(match[0].trim().toLowerCase());
-  }
-  return emails;
-}
-
 // Same file the old in-page console script downloaded: UTF-8 BOM, header
 // "user_identifier,status", CRLF, one row per roster student sorted by email,
 // P = Joined and A = Not-Joined. Students who are not in the group roster are
-// left out of the CSV and reported in "Lms missing names.csv" instead.
+// left out of the CSV; the roster sync looks them up on the dashboard and adds
+// them to groups.xlsx (see group_roster_sync.js), and only the ones it cannot
+// match end up in "Lms missing names.csv".
 function buildAttendanceCsv(records, rosterEmails) {
   const statusByEmail = new Map();
   const notInRoster = [];
@@ -899,12 +853,8 @@ async function runWithConcurrency(items, limit, worker) {
 
     /* ---------- 2) Download attendance for each session ---------- */
 
-    let written = 0;
-    let updated = 0;
-    let unchanged = 0;
-
     await runWithConcurrency(workItems, ATTENDANCE_CONCURRENCY, async (item) => {
-      const { session, group, onlyDate, sessionTopic, absUrl, fileBase } = item;
+      const { session, group, onlyDate, sessionTopic, absUrl } = item;
       const skipBase = { date: onlyDate, group, topic: sessionTopic, status: item.statusText, sessionUrl: absUrl };
 
       if (!session.is_attendance_taken) {
@@ -928,22 +878,69 @@ async function runWithConcurrency(items, limit, worker) {
         return;
       }
 
-      const { content, rowCount, notInRoster } = buildAttendanceCsv(records, parseRosterEmails(item.roster));
+      // The CSV itself is written in step 4, once the rosters had the chance
+      // to grow; here we only note who is missing from the roster right now.
+      item.records = records;
+      const { notInRoster } = buildAttendanceCsv(records, parseRosterEmails(item.roster));
       for (const student of notInRoster) missingNames.push({ ...student, group });
       if (notInRoster.length) {
-        console.log(`⚠️ ${group} | ${onlyDate}: ${notInRoster.length} students are not in the roster (listed in Lms missing names.csv)`);
+        console.log(`⚠️ ${group} | ${onlyDate}: ${notInRoster.length} students are not in the roster; looking them up on the dashboard next`);
+      }
+    });
+
+    /* ---------- 3) Add the missing students to groups.xlsx ---------- */
+
+    // Every missing student (plus the ones still listed in the CSV from earlier
+    // runs) is searched on the dashboard, exactly like the students page search,
+    // and appended to the roster of the group the dashboard lists them in.
+    // Students that cannot be matched stay in "Lms missing names.csv" with a reason.
+    let rosterSync = { additions: [], unresolved: [], missingCsvPath: null };
+    try {
+      rosterSync = await syncMissingStudents({
+        api,
+        apiBase: API_BASE,
+        workbookPath: groupsWorkbookPath,
+        rosterByGroup,
+        candidates: missingNames,
+        exportDir: EXPORT_DIR,
+      });
+    } catch (error) {
+      console.log(`❌ Roster sync failed; the CSVs use the rosters as they are: ${String(error.message).split('\n')[0]}`);
+    }
+
+    /* ---------- 4) Write one attendance CSV per session ---------- */
+
+    let written = 0;
+    let updated = 0;
+    let unchanged = 0;
+    const pendingReuploads = readPendingReuploads();
+    let flaggedForReupload = 0;
+
+    for (const item of workItems) {
+      if (!item.records) continue;
+      const { group, onlyDate, sessionTopic, absUrl, fileBase } = item;
+      const skipBase = { date: onlyDate, group, topic: sessionTopic, status: item.statusText, sessionUrl: absUrl };
+
+      // Read the roster again: step 3 may have just added students to it.
+      const roster = rosterByGroup.get(normalize(group))?.roster;
+      const { content, rowCount, notInRoster } = buildAttendanceCsv(item.records, parseRosterEmails(roster));
+      if (notInRoster.length) {
+        console.log(
+          `⚠️ ${group} | ${onlyDate}: still not in the ${group} roster: ` +
+          notInRoster.map((student) => student.name || student.email).join(', ')
+        );
       }
 
       if (!rowCount) {
         addSkip({ ...skipBase, reason: 'No attendance students matched the roster' });
-        return;
+        continue;
       }
 
       const outPath = getExpectedCsvPath(group, fileBase);
       const previous = fs.existsSync(outPath) ? fs.readFileSync(outPath, 'utf-8') : null;
       if (previous === content) {
         unchanged++;
-        return;
+        continue;
       }
 
       await writeFileWithRetry(outPath, content);
@@ -952,18 +949,35 @@ async function runWithConcurrency(items, limit, worker) {
         console.log(`✅ Saved ${outPath} (${rowCount} students)`);
       } else {
         updated++;
-        console.log(`♻️ Updated ${outPath} (${rowCount} students; attendance changed on the dashboard)`);
+        // The LMS may already hold the old version of this session's attendance;
+        // upload.py re-uploads it because of this entry.
+        pendingReuploads[pendingReuploadKey(outPath)] = {
+          group,
+          date: onlyDate,
+          sessionType: sessionTopic,
+          updatedAt: new Date().toLocaleString('sv-SE'),
+        };
+        flaggedForReupload++;
+        console.log(`♻️ Updated ${outPath} (${rowCount} students; attendance or roster changed) → flagged for LMS re-upload`);
       }
-    });
+    }
 
-    /* ---------- 3) Verify every session is accounted for ---------- */
+    if (flaggedForReupload) {
+      await writeFileWithRetry(PENDING_REUPLOADS_FILE, JSON.stringify(pendingReuploads, null, 2));
+      console.log(
+        `♻️ ${flaggedForReupload} updated CSV(s) flagged for re-upload in ${PENDING_REUPLOADS_FILE} ` +
+        `(${Object.keys(pendingReuploads).length} waiting in total)`
+      );
+    }
+
+    /* ---------- 5) Verify every session is accounted for ---------- */
 
     const finalSkippedSessions = skippedSessions.filter((item, index, arr) =>
       arr.findIndex((x) => x.sessionUrl === item.sessionUrl && x.reason === item.reason) === index
     );
     const stillMissingSessions = workItems
       .filter((item) => !fs.existsSync(getExpectedCsvPath(item.group, item.fileBase)))
-      .map(({ session, roster, ...item }) => item);
+      .map(({ session, roster, records, ...item }) => item);
 
     const accounted =
       skippedByTrack + skippedByFilter + finalSkippedSessions.length + written + updated + unchanged;
@@ -996,7 +1010,10 @@ async function runWithConcurrency(items, limit, worker) {
     console.log('⏭️ skippedNoRoster =', skippedNoRoster);
     console.log('⬇️ new CSVs =', written);
     console.log('♻️ updated CSVs =', updated);
+    console.log('♻️ CSVs waiting for LMS re-upload =', Object.keys(pendingReuploads).length);
     console.log('✔️ already up to date =', unchanged);
+    console.log('➕ students added to groups.xlsx =', rosterSync.additions.length);
+    console.log('❓ students still missing from the rosters =', rosterSync.unresolved.length);
     console.log('🧾 skipped total =', finalSkippedSessions.length);
 
     if (finalSkippedSessions.length) {
@@ -1031,17 +1048,13 @@ async function runWithConcurrency(items, limit, worker) {
       console.log('📌 No skipped sessions -> Excel not created.');
     }
 
-    // حفظ الأسماء الناقصة في CSV تراكمي
-    if (missingNames.length > 0) {
-      const missingCsvPath = await writeLmsMissingNamesCsv(missingNames, EXPORT_DIR);
-      if (missingCsvPath) {
-        const uniqueNamesCount = new Set(
-          missingNames.map((m) => `${normalize(m.name)}||${normalize(m.group)}`)
-        ).size;
-        console.log(`📋 LMS missing names CSV saved: ${missingCsvPath} (${uniqueNamesCount} unique entries, ${missingNames.length} total)`);
-      }
+    if (rosterSync.missingCsvPath) {
+      console.log(
+        `📋 ${MISSING_NAMES_FILE} saved: ${rosterSync.missingCsvPath} ` +
+        `(${rosterSync.unresolved.length} students to add by hand; see the reason column)`
+      );
     } else {
-      console.log('✅ No missing names found!');
+      console.log('✅ No missing names left to add by hand.');
     }
 
     const sortedDates = [...new Set(workItems.map((s) => s.onlyDate).filter(Boolean))].sort();

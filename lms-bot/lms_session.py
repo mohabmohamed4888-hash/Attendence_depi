@@ -370,3 +370,51 @@ def ensure_account(
         return
 
     print(f"✅ Using the saved Chrome session for {session_email or email}.")
+
+
+# =========================
+# SESSIONS TABLE (manage.php)
+# =========================
+# The whole sessions table is read in one page call instead of one call per
+# row. A session whose attendance was already taken shows the green "Change
+# attendance" arrow (an <img ...redo> inside a take.php link; the date and
+# time cells link there too) instead of the "Take attendance" icon. Both bots
+# use this one reader so they agree on what a row means.
+_PARSE_SESSIONS_TABLE_JS = """rows => rows.map((row, index) => {
+    const links = Array.from(row.querySelectorAll('a'));
+    const label = (a) => `${a.getAttribute('aria-label') || ''} ${a.getAttribute('title') || ''}`.toLowerCase();
+    const takeLinks = links.filter((a) => (a.getAttribute('href') || '').includes('/mod/attendance/take.php'));
+    const changeLink = takeLinks.find((a) =>
+        label(a).includes('change attendance') ||
+        Array.from(a.querySelectorAll('img')).some((img) => (img.getAttribute('src') || '').includes('redo'))
+    );
+    const takeLink = takeLinks.find((a) =>
+        label(a).includes('take attendance') || a.querySelector("i[class*='fa-play']")
+    );
+    const editLink = links.find((a) => label(a).includes('edit session'));
+    return {
+        index,
+        text: (row.innerText || '').replace(/\\s+/g, ' ').trim(),
+        take_href: takeLink ? takeLink.href : '',
+        change_href: changeLink ? changeLink.href : '',
+        edit_href: editLink ? editLink.href : '',
+    };
+})"""
+
+
+def parse_sessions_table(page) -> "list[dict]":
+    """One dict per row of table.generaltable, in table order.
+
+    Keys: index (0-based), text (row text, spaces collapsed), take_href,
+    change_href, edit_href (absolute URLs or ''), session_id (from those
+    links) and attendance_taken (True when the row has "Change attendance").
+    """
+    rows = page.locator("table.generaltable tbody tr").evaluate_all(_PARSE_SESSIONS_TABLE_JS)
+    out = []
+    for row in rows or []:
+        hrefs = " ".join([row.get("edit_href", ""), row.get("change_href", ""), row.get("take_href", "")])
+        match = re.search(r"sessionid=(\d+)", hrefs)
+        row["session_id"] = match.group(1) if match else ""
+        row["attendance_taken"] = bool(row.get("change_href"))
+        out.append(row)
+    return out
