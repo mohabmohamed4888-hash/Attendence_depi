@@ -21,6 +21,14 @@ const {
   parseRosterEmails,
   syncMissingStudents,
 } = require('./group_roster_sync');
+const {
+  STATUS_FILE,
+  MISSING_FROM_WAVZ_FILE,
+  readStatusMap,
+  writeStatusMap,
+  recordStatusesFromAttendance,
+  cleanMissingFromWavz,
+} = require('./student_status');
 
 /* =======================
    SETTINGS
@@ -853,6 +861,13 @@ async function runWithConcurrency(items, limit, worker) {
 
     /* ---------- 2) Download attendance for each session ---------- */
 
+    // Every attendance record carries its student's dashboard status, so the
+    // status file is refreshed here without any extra request. upload.py uses
+    // it to leave students who left the program out of the missing-from-Wavz
+    // list (see student_status.js).
+    const studentStatuses = readStatusMap(EXPORT_DIR);
+    const knownStatusesBefore = Object.keys(studentStatuses).length;
+
     await runWithConcurrency(workItems, ATTENDANCE_CONCURRENCY, async (item) => {
       const { session, group, onlyDate, sessionTopic, absUrl } = item;
       const skipBase = { date: onlyDate, group, topic: sessionTopic, status: item.statusText, sessionUrl: absUrl };
@@ -881,6 +896,7 @@ async function runWithConcurrency(items, limit, worker) {
       // The CSV itself is written in step 4, once the rosters had the chance
       // to grow; here we only note who is missing from the roster right now.
       item.records = records;
+      recordStatusesFromAttendance(studentStatuses, records, group);
       const { notInRoster } = buildAttendanceCsv(records, parseRosterEmails(item.roster));
       for (const student of notInRoster) missingNames.push({ ...student, group });
       if (notInRoster.length) {
@@ -1046,6 +1062,37 @@ async function runWithConcurrency(items, limit, worker) {
       console.log('📌 Skipped sessions Excel saved:', excelPath);
     } else {
       console.log('📌 No skipped sessions -> Excel not created.');
+    }
+
+    /* ---------- The dashboard status file and the missing-from-Wavz list ---------- */
+
+    const statusPath = writeStatusMap(EXPORT_DIR, studentStatuses);
+    const knownStatuses = Object.keys(studentStatuses).length;
+    if (statusPath) {
+      console.log(
+        `🧾 ${STATUS_FILE} saved: ${knownStatuses} students ` +
+        `(${knownStatuses - knownStatusesBefore} new since the last run)`
+      );
+    }
+
+    try {
+      const cleaned = await cleanMissingFromWavz({
+        api,
+        apiBase: API_BASE,
+        exportDir: EXPORT_DIR,
+        students: studentStatuses,
+        parseCsvRows,
+      });
+      if (cleaned.removed) {
+        writeStatusMap(EXPORT_DIR, studentStatuses);
+        console.log(
+          `🧾 ${MISSING_FROM_WAVZ_FILE}: ${cleaned.kept} active student(s) left to enroll on the LMS`
+        );
+      }
+    } catch (error) {
+      console.log(
+        `⚠️ Could not clean ${MISSING_FROM_WAVZ_FILE}: ${String(error.message).split('\n')[0]}`
+      );
     }
 
     if (rosterSync.missingCsvPath) {

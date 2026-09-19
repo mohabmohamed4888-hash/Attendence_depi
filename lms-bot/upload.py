@@ -58,6 +58,12 @@ MISSING_FROM_WAVZ_PATH = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "exports", "missing from wavz.csv")
 )
 EXPORTS_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "exports"))
+# Dashboard status of every student, refreshed by run_attendance.js at no cost
+# from the attendance records (see student_status.js). A student the LMS
+# refuses is only worth reporting while they are still active on the dashboard:
+# for someone who left the program, not being in the Wavz course is expected.
+STUDENT_STATUS_PATH = os.path.join(EXPORTS_ROOT, "student_status.json")
+STUDENT_STATUS: dict[str, str] = {}
 # Written by run_attendance.js whenever it rewrites a CSV with different content.
 # Sessions listed here are uploaded again even when the LMS already has attendance.
 PENDING_REUPLOADS_PATH = os.path.join(EXPORTS_ROOT, "pending_reuploads.json")
@@ -553,10 +559,62 @@ def read_attendance_statuses(csv_path: str) -> dict[str, str]:
     return statuses
 
 
+# =========================
+# DASHBOARD STATUS
+# =========================
+def normalize_status(status: str) -> str:
+    """"Not Active", "not_active" and "not-active" are the same thing."""
+    return re.sub(r"[^a-z0-9]+", "_", str(status or "").strip().lower()).strip("_")
+
+
+def load_student_status():
+    """Reads exports/student_status.json (written by run_attendance.js)."""
+    STUDENT_STATUS.clear()
+    if not os.path.isfile(STUDENT_STATUS_PATH):
+        print(
+            f"ℹ️ {os.path.basename(STUDENT_STATUS_PATH)} not found: every student the LMS refuses "
+            "will be listed. Run the attendance export once to create it."
+        )
+        return
+
+    try:
+        with open(STUDENT_STATUS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        students = data.get("students") if isinstance(data, dict) else None
+        if not isinstance(students, dict):
+            return
+        for email, info in students.items():
+            status = normalize_status(
+                info.get("status") if isinstance(info, dict) else info
+            )
+            if status:
+                STUDENT_STATUS[str(email).strip().lower()] = status
+    except Exception as e:
+        print(f"⚠️ Could not read {os.path.basename(STUDENT_STATUS_PATH)}: {e}")
+        return
+
+    not_active = sum(1 for s in STUDENT_STATUS.values() if s != "active")
+    print(
+        f"🧾 Dashboard status loaded for {len(STUDENT_STATUS)} students "
+        f"({not_active} not active); not-active students are left out of the missing-from-Wavz list."
+    )
+
+
+def is_not_active_on_dashboard(email: str) -> bool:
+    """True only when the status is known AND is not "active".
+
+    An unknown status never hides a student: it would hide a real enrolment
+    problem behind a missing lookup.
+    """
+    status = STUDENT_STATUS.get(str(email or "").strip().lower(), "")
+    return bool(status) and status != "active"
+
+
 def load_existing_missing_from_wavz():
     if not os.path.isfile(MISSING_FROM_WAVZ_PATH):
         return
 
+    dropped = []
     try:
         with open(MISSING_FROM_WAVZ_PATH, "r", newline="", encoding="utf-8-sig") as f:
             for row in csv.DictReader(f):
@@ -566,17 +624,35 @@ def load_existing_missing_from_wavz():
                     "status": str(row.get("status", "") or "").strip().upper(),
                     "csv_file": str(row.get("csv_file", "") or "").strip(),
                 }
+                if not normalized["email"]:
+                    continue
+                # Students who left the program are dropped from the old list too.
+                if is_not_active_on_dashboard(normalized["email"]):
+                    dropped.append(normalized["email"])
+                    continue
                 key = (
                     normalized["group"],
                     normalized["email"],
                     normalized["status"],
                     normalized["csv_file"],
                 )
-                if normalized["email"] and key not in MISSING_FROM_WAVZ_KEYS:
+                if key not in MISSING_FROM_WAVZ_KEYS:
                     MISSING_FROM_WAVZ_KEYS.add(key)
                     MISSING_FROM_WAVZ_ROWS.append(normalized)
     except Exception as e:
         print(f"⚠️ Could not read existing missing-from-Wavz report: {e}")
+        return
+
+    if dropped:
+        print(
+            f"🧹 Dropped {len(dropped)} row(s) from the old missing-from-Wavz list: "
+            f"not active on the dashboard ({', '.join(sorted(set(dropped))[:5])}"
+            f"{', ...' if len(set(dropped)) > 5 else ''})"
+        )
+        try:
+            write_missing_from_wavz()
+        except Exception as e:
+            print(f"⚠️ Could not rewrite the missing-from-Wavz report: {e}")
 
 
 def write_missing_from_wavz():
@@ -650,6 +726,18 @@ def collect_missing_from_wavz(page, group_name: str, csv_path: str) -> int:
         for match in pattern.finditer(text or ""):
             missing_emails.add(match.group(1).strip().lower())
 
+    if not missing_emails:
+        return 0
+
+    # A student who is not active on the dashboard left the program, so the LMS
+    # refusing them is expected and they are not reported.
+    not_active = sorted(e for e in missing_emails if is_not_active_on_dashboard(e))
+    if not_active:
+        missing_emails -= set(not_active)
+        print(
+            f"🧹 Not reported ({len(not_active)} not active on the dashboard): "
+            + ", ".join(not_active)
+        )
     if not missing_emails:
         return 0
 
@@ -1092,6 +1180,7 @@ def run_profile(page, profile: dict):
 # MAIN
 # =========================
 def main():
+    load_student_status()
     load_existing_missing_from_wavz()
     load_pending_reuploads()
 
