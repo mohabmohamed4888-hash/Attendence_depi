@@ -494,11 +494,15 @@ async function loginAndCaptureApiHeaders(page) {
   await page.fill('input[type="email"]', EMAIL);
   await page.fill('#password', PASSWORD);
   await page.click('button:has-text("Login")');
-  await page.waitForLoadState('networkidle');
 
-  if (page.url().includes('/auth/login')) {
+  // The login page is already network-idle before the click, so waiting for
+  // that returns at once; wait for the redirect away from /auth/login instead.
+  try {
+    await page.waitForURL((url) => !url.pathname.includes('/auth/login'), { timeout: 60000 });
+  } catch {
     throw new Error('Login failed. Check LOGIN_EMAIL / LOGIN_PASSWORD in .env');
   }
+  await page.waitForLoadState('networkidle');
   console.log('✅ Logged in');
 
   // Opening the sessions page makes the dashboard call its API with the
