@@ -6,6 +6,7 @@ contextBridge.exposeInMainWorld('electron', {
   cleanExports: () => ipcRenderer.send('clean-exports'),
   startLmsUpload: (config) => ipcRenderer.send('start-lms-upload', config),
   startLmsEdit: (config) => ipcRenderer.send('start-lms-edit', config),
+  startLmsFastSync: (config) => ipcRenderer.send('start-lms-fast-sync', config),
   startDashboardLinkEdit: (config) => ipcRenderer.send('start-dashboard-link-edit', config),
   stopProcess: () => ipcRenderer.send('stop-process'),
   onLog: (callback) => ipcRenderer.on('log', (event, message) => callback(message)),

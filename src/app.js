@@ -478,6 +478,8 @@ function setActionButtonsRunning(running) {
   document.getElementById('dashboardLinkBtn').disabled = running;
   document.getElementById('fullRunBtn').disabled = running;
   document.getElementById('cleanExportsBtn').disabled = running;
+  document.getElementById('fastSyncBtn').disabled = running;
+  document.getElementById('fastCheckBtn').disabled = running;
 }
 
 function getFormValues(requireRound = false) {
@@ -699,6 +701,29 @@ function startLmsUpload() {
     trackFilter: formValues.trackFilter,
     lmsView: formValues.lmsView,
     forceReupload: formValues.forceReupload,
+  });
+}
+
+// Fast Sync: creates only the missing sessions and uploads only the missing
+// attendance (lms-bot/fast_sync.py). Check Missing lists them and changes nothing.
+function startLmsFastSync(planOnly = false) {
+  const formValues = getFormValues();
+  if (!formValues) return;
+  if (!planOnly && !confirmForceReupload(formValues)) {
+    addLogEntry('Fast sync cancelled.', 'info');
+    return;
+  }
+
+  beginRun(planOnly ? 'lms-fast-check' : 'lms-fast-sync', planOnly ? 'Checking Missing' : 'Running Fast Sync');
+  window.electron.startLmsFastSync({
+    dateFrom: formValues.dateFrom,
+    groupFilter: formValues.groupFilter,
+    roundFilter: formValues.roundFilter,
+    batchFilter: formValues.batchFilter,
+    trackFilter: formValues.trackFilter,
+    lmsView: formValues.lmsView,
+    forceReupload: planOnly ? false : formValues.forceReupload,
+    planOnly,
   });
 }
 

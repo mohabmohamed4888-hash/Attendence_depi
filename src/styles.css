@@ -738,6 +738,16 @@ body::after {
   box-shadow: 0 18px 28px -18px rgba(234, 88, 12, 0.72);
 }
 
+.btn-fast {
+  background: linear-gradient(135deg, #eab308, #ca8a04);
+  box-shadow: 0 18px 28px -18px rgba(202, 138, 4, 0.72);
+}
+
+.btn-fast-check {
+  background: linear-gradient(135deg, #14b8a6, #0f766e);
+  box-shadow: 0 18px 28px -18px rgba(15, 118, 110, 0.72);
+}
+
 .btn-link-edit {
   background: linear-gradient(135deg, #8b5cf6, #6d28d9);
   box-shadow: 0 18px 28px -18px rgba(109, 40, 217, 0.72);

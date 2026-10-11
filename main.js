@@ -273,6 +273,30 @@ function lmsUploadStep(config) {
   };
 }
 
+// lms-bot/fast_sync.py: reads every group's LMS table at once, then creates
+// only the missing sessions and uploads only the missing attendance. With
+// planOnly it just writes the missing list (exports/lms_missing_sessions.csv).
+function lmsFastSyncStep(config, planOnly) {
+  return {
+    taskId: planOnly ? 'lms-fast-check' : 'lms-fast-sync',
+    label: planOnly ? 'LMS missing check' : 'LMS fast sync',
+    command: 'python',
+    args: ['-X', 'utf8', '-u', path.join('lms-bot', 'fast_sync.py'), ...(planOnly ? ['--plan'] : [])],
+    options: {
+      cwd: __dirname,
+      env: lmsEnv(config, {
+        START_FROM_DATE: config.dateFrom || '',
+        FORCE_REUPLOAD: config.forceReupload ? 'true' : 'false',
+      }),
+    },
+  };
+}
+
+ipcMain.on('start-lms-fast-sync', (event, config) => {
+  const step = lmsFastSyncStep(config, Boolean(config && config.planOnly));
+  startManagedProcess(event, step.taskId, step.label, step.command, step.args, step.options);
+});
+
 ipcMain.on('start-attendance', (event, config) => {
   const step = attendanceStep(config);
   startManagedProcess(event, step.taskId, step.label, step.command, step.args, step.options);
