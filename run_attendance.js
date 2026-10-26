@@ -1,10 +1,13 @@
 require('dotenv').config();
+function progress(values) { console.log('@@PROGRESS ' + JSON.stringify(values)); }
+function exportProgress(item, status, reason = '') { progress({kind:'session',group:item.group,track:getGroupTrack(item.group)||'technical',date:item.onlyDate,title:item.finishedTitle||item.sessionTopic,phase:'export',status,reason,retryable:true, source:'dashboard', exportId:item.sessionId}); }
 const { chromium } = require('playwright');
 const XLSX = require('xlsx');
 const fs = require('fs');
 const path = require('path');
 const { GROUP_BATCHES } = require('./group_batches');
 const {
+  getGroupTrack,
   getGroupCategory,
   matchesTrack,
   normalizeTrack,
@@ -36,6 +39,7 @@ const {
 
 // Read config from command line arguments or use defaults
 let configFile = null;
+let RETRY_SESSION_ID = '';
 let configArg = process.argv.indexOf('--config');
 if (configArg !== -1 && process.argv[configArg + 1]) {
   configFile = process.argv[configArg + 1];
@@ -67,6 +71,7 @@ function parseGroupList(raw) {
 if (configFile && fs.existsSync(configFile)) {
   try {
     const config = JSON.parse(fs.readFileSync(configFile, 'utf-8'));
+    RETRY_SESSION_ID = String(config.retrySessionId || "");
     if (config.dateFrom) DATE_FROM = config.dateFrom;
     if (config.dateTo) DATE_TO = config.dateTo;
     if (config.groupFilter) GROUP_FILTERS = parseGroupList(config.groupFilter);
@@ -771,6 +776,7 @@ async function runWithConcurrency(items, limit, worker) {
   let browser = null;
 
   try {
+    progress({kind:'phase',phase:'export',status:'running'});
     console.log('🚀 Script started');
     console.log(`📅 Date Range: FROM ${DATE_FROM} TO ${DATE_TO}`);
 
@@ -823,13 +829,19 @@ async function runWithConcurrency(items, limit, worker) {
     /* ---------- 1) Discover every session in the date range ---------- */
 
     console.log('⚡ Listing sessions from the dashboard API, one day at a time...');
-    const allSessions = await listAllSessions(api, DATE_FROM, DATE_TO);
+    let allSessions = await listAllSessions(api, DATE_FROM, DATE_TO);
+    if (RETRY_SESSION_ID) { allSessions = allSessions.filter(s => s.id === RETRY_SESSION_ID); if (!allSessions.length) throw new Error("Retry session was not found in the selected date/group."); }
     console.log(`✅ Dashboard has ${allSessions.length} sessions in ${DATE_FROM} → ${DATE_TO}`);
 
     const skippedSessions = [];
     const missingNames = [];
 
     const addSkip = ({ date, group, topic, status, reason, sessionUrl }) => {
+      const raw = allSessions.find(s => `${SESSIONS_URL}/${s.id}` === sessionUrl);
+      if (raw && group) {
+        const title = formatFinishedTitle({sessionNameRaw:raw.name||'',sessionDateRaw:getApiSessionDateTimeRaw(raw),modeRaw:raw.delivery_mode||'',typeRaw:topic}) || topic;
+        exportProgress({group,onlyDate:date,finishedTitle:title,sessionId:raw.id}, 'error', reason);
+      }
       skippedSessions.push({
         date: date || '',
         group: group || '',
@@ -919,6 +931,7 @@ async function runWithConcurrency(items, limit, worker) {
 
       workItems.push({
         session,
+        finishedTitle,
         group,
         onlyDate,
         sessionTopic,
@@ -961,6 +974,7 @@ async function runWithConcurrency(items, limit, worker) {
 
     await runWithConcurrency(workItems, ATTENDANCE_CONCURRENCY, async (item) => {
       const { session, group, onlyDate, sessionTopic, absUrl } = item;
+      exportProgress(item, "running");
       const skipBase = { date: onlyDate, group, topic: sessionTopic, status: item.statusText, sessionUrl: absUrl };
 
       if (!session.is_attendance_taken) {
@@ -1024,7 +1038,7 @@ async function runWithConcurrency(items, limit, worker) {
     let flaggedForReupload = 0;
 
     for (const item of workItems) {
-      if (!item.records) continue;
+      if (!item.records) { exportProgress(item, "error", skippedSessions.find(s=>s.sessionUrl===item.absUrl)?.reason || "Attendance records were not available; see Activity log for details."); continue; }
       const { group, onlyDate, sessionTopic, absUrl, fileBase } = item;
       const skipBase = { date: onlyDate, group, topic: sessionTopic, status: item.statusText, sessionUrl: absUrl };
 
@@ -1040,6 +1054,7 @@ async function runWithConcurrency(items, limit, worker) {
 
       if (!rowCount) {
         addSkip({ ...skipBase, reason: 'No attendance students matched the roster' });
+        exportProgress(item, 'error', 'No attendance students matched the roster');
         continue;
       }
 
@@ -1047,6 +1062,7 @@ async function runWithConcurrency(items, limit, worker) {
       const previous = fs.existsSync(outPath) ? fs.readFileSync(outPath, 'utf-8') : null;
       if (previous === content) {
         unchanged++;
+        exportProgress(item, 'done');
         continue;
       }
 
@@ -1067,6 +1083,7 @@ async function runWithConcurrency(items, limit, worker) {
         flaggedForReupload++;
         console.log(`♻️ Updated ${outPath} (${rowCount} students; attendance or roster changed) → flagged for LMS re-upload`);
       }
+      exportProgress(item, "done");
     }
 
     if (flaggedForReupload) {
@@ -1198,6 +1215,7 @@ async function runWithConcurrency(items, limit, worker) {
     const sortedDates = [...new Set(workItems.map((s) => s.onlyDate).filter(Boolean))].sort();
     console.log(`📆 Unique session dates exported (${sortedDates.length}): ${sortedDates.join(', ')}`);
 
+    progress({kind:'phase',phase:'export',status:'done'});
     console.log('🎉 Done');
   } catch (error) {
     console.log(`[ERROR] ${error.message}`);

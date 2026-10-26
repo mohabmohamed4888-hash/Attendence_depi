@@ -1,0 +1,12 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>DEPI - Groups &amp; Sessions</title><link rel="stylesheet" href="styles.css"><link rel="stylesheet" href="progress.css"></head>
+<body class="progress-page"><main class="progress-shell"><header class="progress-header"><div><h1>Groups &amp; sessions</h1><p>Live progress · Sessions are shown automatically below each group.</p></div><div class="monitor-tabs"><button id="showControls" type="button">Run controls</button><button id="expandGroups" type="button">Expand all</button><button id="collapseGroups" type="button">Collapse all</button></div></header><p id="monitorNotice" role="alert" hidden></p><section id="runMonitor" class="run-monitor" aria-label="Run progress">
+<div class="monitor-heading"><strong id="monitorRunStatus">Ready</strong><span id="monitorHeartbeat">No run yet</span></div>
+<p id="monitorCurrent" class="monitor-current"></p>
+<aside id="monitorRunning" class="monitor-running" aria-label="Current running work"></aside>
+<div id="monitorStages" class="monitor-stages"></div>
+<div id="monitorTracks" class="monitor-tracks"></div>
+<div class="monitor-filters"><select id="monitorTrackFilter" class="text-input" aria-label="Track"><option value="all">All tracks</option><option value="technical">Technical</option><option value="nontechnical">Non-Technical</option></select><input id="monitorSearch" class="text-input" placeholder="Search groups or session titles" aria-label="Search progress"><select id="monitorFilter" class="text-input" aria-label="Filter progress"><option value="all">All groups</option><option value="error">Errors / interrupted</option><option value="pending">Pending work</option><option value="done">Uploaded / up to date</option><option value="empty">No sessions in folder</option></select></div>
+<div id="monitorGroups" class="monitor-groups"></div>
+<div class="monitor-pagination"><button id="monitorPrev" type="button">Previous</button><span id="monitorPage"></span><button id="monitorNext" type="button">Next</button></div>
+</section></main><script src="monitor.js"></script></body></html>

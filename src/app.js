@@ -77,7 +77,7 @@ function setupProcessEndedListener() {
     setFormDisabled(false);
     setActionButtonsRunning(false);
     document.getElementById('stopBtn').disabled = true;
-    updateStatus(code === 0 ? 'Completed' : 'Ready');
+    updateStatus(code === 0 ? 'Completed' : code == null ? 'Stopped' : 'Failed');
   });
 }
 
@@ -642,8 +642,9 @@ function confirmForceReupload(formValues) {
   );
 }
 
-// Attendance -> Sync / Edit sessions -> Upload, one after the other with no
-// waiting in between. The main process stops the run if a step fails.
+// Attendance -> LMS (check missing -> Sync / Edit sessions -> Upload), one
+// after the other with no waiting in between. The main process stops the run
+// if a step fails.
 function startFullRun() {
   const formValues = getFormValues(true);
   if (!formValues) return;
@@ -653,7 +654,7 @@ function startFullRun() {
   }
 
   beginRun('full-run', 'Running Everything');
-  addLogEntry('Full run: Attendance -> Sync / Edit Sessions -> Upload Attendance', 'info');
+  addLogEntry('Full run: Attendance -> Check missing -> Sync / Edit Sessions -> Upload Attendance', 'info');
   window.electron.startFullRun(formValues);
 }
 
@@ -695,6 +696,7 @@ function startLmsUpload() {
   beginRun('lms-upload', 'Running LMS Upload');
   window.electron.startLmsUpload({
     dateFrom: formValues.dateFrom,
+    dateTo: formValues.dateTo,
     groupFilter: formValues.groupFilter,
     roundFilter: formValues.roundFilter,
     batchFilter: formValues.batchFilter,
@@ -717,6 +719,7 @@ function startLmsFastSync(planOnly = false) {
   beginRun(planOnly ? 'lms-fast-check' : 'lms-fast-sync', planOnly ? 'Checking Missing' : 'Running Fast Sync');
   window.electron.startLmsFastSync({
     dateFrom: formValues.dateFrom,
+    dateTo: formValues.dateTo,
     groupFilter: formValues.groupFilter,
     roundFilter: formValues.roundFilter,
     batchFilter: formValues.batchFilter,
@@ -733,6 +736,8 @@ function startLmsEdit() {
 
   beginRun('lms-edit', 'Running LMS Edit');
   window.electron.startLmsEdit({
+    dateFrom: formValues.dateFrom,
+    dateTo: formValues.dateTo,
     groupFilter: formValues.groupFilter,
     roundFilter: formValues.roundFilter,
     batchFilter: formValues.batchFilter,

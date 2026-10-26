@@ -158,3 +158,32 @@ exports/
 ---
 
 **تم إنشاؤه بـ ❤️ لجعل تسجيل الحضور أسهل**
+
+## متابعة الجروبات والسيشنات
+
+افتح تبويب **Groups & sessions** لمتابعة Export ثم Check ثم Add / Sync ثم Upload.
+يوجد شريط للتكنيكال وآخر للنون تكنيكال، وبحث وفلاتر للأخطاء والجروبات التي لا تحتوي
+على ملفات حضور. اضغط على الجروب لعرض سيشناته. علامة النجاح في Upload تعني أن الحضور
+تم التحقق منه على LMS أو كان موجودًا بالفعل، وليس مجرد انتهاء العملية.
+
+زر **Retry this session** يظهر للأخطاء أو التشغيل المتوقف، ويتاح بعد توقف التشغيل
+الحالي. يعيد فحص السيشن المحددة قبل استكمال العمل؛ إذا كان السبب ملفًا ناقصًا أو
+بيانات غير صحيحة، أصلح السبب ثم أعد المحاولة. نتائج المتابعة تحفظ محليًا في
+`exports/gui_progress.json`. **Check Missing** يفحص ويعرض النتائج فقط.
+
+اختبارات المتابعة (بدون رفع بيانات حقيقية):
+
+```bash
+node --test tests/run_monitor.test.js tests/retry_ipc.test.js
+python tests/test_retry_scope.py
+node tests/monitor_gui.cjs
+node tests/monitor_electron.cjs
+```
+
+### Full progress window
+
+Click **Open full progress** beside the progress tabs to open a separate, maximized window. It shows the saved results and live updates from the current run, with Technical / Non-Technical filters, search, status filters, pagination, and Expand all / Collapse all controls. Sessions and verified Export / Check / Add-Sync / Upload steps are expanded automatically, including newly discovered groups and other pages. You can collapse individual groups or use Collapse all. Failed, retryable sessions have a **Retry this session** button; retry is disabled while another process is running. **Run controls** returns to the main window. Closing only the progress window leaves the run running.
+
+You can also launch directly into this view with `npm start -- --progress`.
+
+**Running now** stays visible at the top while scrolling. It shows active sessions and their current stage regardless of the selected page, search, track, or status filter. During group checks it lists the groups being scanned; when multiple operations run together it lists them all. Completed or stopped operations are removed from this panel.

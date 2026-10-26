@@ -1,6 +1,14 @@
 const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
 const { spawn } = require('child_process');
+const { StringDecoder } = require('string_decoder');
+const { RunMonitor, lineDecoder } = require('./run_monitor');
+const monitor = new RunMonitor(require('path').join(__dirname, 'exports', 'gui_progress.json'));
+let monitorTimer;
+function publishMonitor(event) {
+  if (monitorTimer) return;
+  monitorTimer = setTimeout(() => { monitorTimer = null; monitor.save(); broadcast('run-progress', monitor.state); }, 120);
+}
 const fs = require('fs');
 const { GROUP_BATCHES } = require('./group_batches');
 const ROUND_5_GROUP_IDS = require('./lms-bot/round5_groups.json');
@@ -9,6 +17,32 @@ const { normalizeTrack, getGroupTrack } = require('./group_tracks');
 const { resolveGroupsWorkbookPath } = require('./group_workbook');
 
 let mainWindow;
+let progressWindow;
+function broadcast(channel, payload) {
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win.isDestroyed()) win.webContents.send(channel, payload);
+  }
+}
+function createProgressWindow() {
+  if (progressWindow && !progressWindow.isDestroyed()) {
+    if (progressWindow.isMinimized()) progressWindow.restore();
+    progressWindow.show(); progressWindow.focus(); return;
+  }
+  const win = progressWindow = new BrowserWindow({
+    title: 'DEPI · Groups & Sessions', width: 1440, height: 900,
+    minWidth: 800, minHeight: 600, show: false, backgroundColor: '#08131f',
+    webPreferences: {preload: path.join(__dirname, 'preload.js'), contextIsolation: true, spellcheck: false, backgroundThrottling: false}
+  });
+  win.loadFile(path.join(__dirname, 'src', 'progress.html'));
+  win.once('ready-to-show', () => { win.maximize(); win.show(); });
+  win.on('closed', () => { progressWindow = null; });
+}
+ipcMain.handle('open-progress', () => { createProgressWindow(); return {ok: true}; });
+ipcMain.handle('show-controls', () => {
+  if (!mainWindow) createWindow();
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show(); mainWindow.focus();
+});
 let currentProcess = null;
 let currentTaskId = null;
 let chainRunning = false;
@@ -106,7 +140,7 @@ function createWindow() {
   });
 }
 
-app.on('ready', createWindow);
+app.on('ready', () => { createWindow(); if (process.argv.includes('--progress')) createProgressWindow(); });
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
@@ -130,6 +164,16 @@ function runStep(event, step) {
     let settled = false;
 
     currentTaskId = taskId;
+    if (!options.retry && !(chainRunning && taskId !== 'attendance')) monitor.start(taskId);
+    else { monitor.state.running = true; monitor.state.task = taskId; }
+    publishMonitor(event);
+    let stderrSummary = '';
+    const decoder = new StringDecoder('utf8');
+    const lines = lineDecoder((line) => {
+      if (line.startsWith('@@PROGRESS ')) {
+        try { monitor.apply(JSON.parse(line.slice(11))); publishMonitor(event); } catch { /* invalid event stays out of state */ }
+      } else { appendToLogBuffer(line + '\n'); event.reply('log', line + '\n'); }
+    });
     event.reply('log', `[START] Starting ${label}...\n`);
 
     const child = spawn(command, args, {
@@ -143,6 +187,11 @@ function runStep(event, step) {
       if (settled) return;
       settled = true;
 
+      lines.push(decoder.end());
+      lines.flush();
+      if (code !== 0 && stderrSummary.trim()) monitor.state.reason = stderrSummary.trim().split(/\r?\n/).filter(Boolean).pop();
+      if (!chainRunning) monitor.end(code);
+      publishMonitor(event);
       if (cleanup) {
         try {
           cleanup();
@@ -151,7 +200,7 @@ function runStep(event, step) {
         }
       }
 
-      event.reply('log', `\n[OK] ${label} ended with code ${code}\n`);
+      event.reply('log', `\n[${code === 0 ? 'OK' : code == null ? 'STOP' : 'ERROR'}] ${label} ended with code ${code}\n`);
       if (currentProcess === child) {
         currentProcess = null;
         currentTaskId = null;
@@ -160,18 +209,20 @@ function runStep(event, step) {
     };
 
     child.stdout.on('data', (data) => {
-      const log = data.toString();
-      appendToLogBuffer(log);
-      event.reply('log', log);
+      lines.push(decoder.write(data));
     });
 
     child.stderr.on('data', (data) => {
-      const log = `ERROR: ${data.toString()}`;
+      const stderrText = data.toString();
+      stderrSummary = (stderrSummary + stderrText).slice(-4000);
+      const log = `ERROR: ${stderrText}`;
       appendToLogBuffer(log);
       event.reply('log', log);
     });
 
     child.on('error', (error) => {
+      monitor.state.reason = `Failed to start ${label}: ${error.message}`;
+      publishMonitor(event);
       const log = `ERROR: Failed to start ${label}: ${error.message}\n`;
       appendToLogBuffer(log);
       event.reply('log', log);
@@ -209,6 +260,7 @@ function attendanceStep(config) {
   fs.writeFileSync(
     configPath,
     JSON.stringify({
+      retrySessionId: config.retrySessionId,
       dateFrom: config.dateFrom,
       dateTo: config.dateTo,
       groupFilter: config.groupFilter,
@@ -247,53 +299,54 @@ function lmsEnv(config, extra = {}) {
   };
 }
 
-function lmsEditStep(config) {
-  return {
-    taskId: 'lms-edit',
-    label: 'LMS edit',
-    command: 'python',
-    args: ['-X', 'utf8', '-u', path.join('lms-bot', 'edit.py')],
-    options: { cwd: __dirname, env: lmsEnv(config) },
+// Every LMS button runs lms-bot/fast_sync.py: it first reads every group's
+// LMS sessions table at once and checks what is missing (written to
+// exports/lms_missing_sessions.csv), then does only that:
+//   step 'sessions' = create / fix the sessions   (Sync / Edit Sessions)
+//   step 'upload'   = upload the attendance        (Upload Attendance)
+//   step 'all'      = both, in that order           (Fast Sync, Run Everything)
+// With planOnly it only checks and changes nothing (Check Missing).
+// The older lms-bot/edit.py and upload.py are left in place, unused here.
+function lmsFastSyncStep(config, { step = 'all', planOnly = false, fullRun = false } = {}) {
+  const ids = {
+    sessions: ['lms-edit', 'LMS sync / edit sessions'],
+    upload: ['lms-upload', 'LMS upload'],
+    all: ['lms-fast-sync', 'LMS fast sync'],
   };
+  const [taskId, label] = planOnly ? ['lms-fast-check', 'LMS missing check'] : ids[step];
+  return {
+    taskId,
+    label,
+    command: 'python',
+    args: [
+      '-X', 'utf8', '-u', path.join('lms-bot', 'fast_sync.py'),
+      '--step', step,
+      ...(planOnly ? ['--plan'] : []),
+    ],
+    options: {
+      cwd: __dirname,
+      env: lmsEnv(config, {
+        START_FROM_DATE: config.dateFrom || '',
+        END_AT_DATE: config.dateTo || '',
+        RETRY_SESSION: config.retrySession ? JSON.stringify(config.retrySession) : '',
+        FORCE_REUPLOAD: config.forceReupload ? 'true' : 'false',
+        // Run Everything: the script prints its stages as 2-4 of 4.
+        FULL_RUN_STAGES: fullRun ? '1' : '',
+      }),
+    },
+  };
+}
+
+function lmsEditStep(config) {
+  return lmsFastSyncStep(config, { step: 'sessions' });
 }
 
 function lmsUploadStep(config) {
-  return {
-    taskId: 'lms-upload',
-    label: 'LMS upload',
-    command: 'python',
-    args: ['-X', 'utf8', '-u', path.join('lms-bot', 'upload.py')],
-    options: {
-      cwd: __dirname,
-      env: lmsEnv(config, {
-        START_FROM_DATE: config.dateFrom || '',
-        FORCE_REUPLOAD: config.forceReupload ? 'true' : 'false',
-      }),
-    },
-  };
-}
-
-// lms-bot/fast_sync.py: reads every group's LMS table at once, then creates
-// only the missing sessions and uploads only the missing attendance. With
-// planOnly it just writes the missing list (exports/lms_missing_sessions.csv).
-function lmsFastSyncStep(config, planOnly) {
-  return {
-    taskId: planOnly ? 'lms-fast-check' : 'lms-fast-sync',
-    label: planOnly ? 'LMS missing check' : 'LMS fast sync',
-    command: 'python',
-    args: ['-X', 'utf8', '-u', path.join('lms-bot', 'fast_sync.py'), ...(planOnly ? ['--plan'] : [])],
-    options: {
-      cwd: __dirname,
-      env: lmsEnv(config, {
-        START_FROM_DATE: config.dateFrom || '',
-        FORCE_REUPLOAD: config.forceReupload ? 'true' : 'false',
-      }),
-    },
-  };
+  return lmsFastSyncStep(config, { step: 'upload' });
 }
 
 ipcMain.on('start-lms-fast-sync', (event, config) => {
-  const step = lmsFastSyncStep(config, Boolean(config && config.planOnly));
+  const step = lmsFastSyncStep(config, { planOnly: Boolean(config && config.planOnly) });
   startManagedProcess(event, step.taskId, step.label, step.command, step.args, step.options);
 });
 
@@ -314,12 +367,12 @@ ipcMain.on('start-lms-edit', (event, config) => {
 
 /* =======================
    FULL RUN
-   Attendance -> Sync/Edit sessions -> Upload, back to back with no idle time
-   in between. The order is the one the data needs: the attendance export
-   writes the CSVs and the session titles, the sync makes sure every session
-   exists on the LMS, and only then is the attendance uploaded onto it.
-   A step that fails stops the run: uploading onto sessions that were never
-   synced would put attendance on the wrong rows.
+   Attendance -> LMS (check missing -> sync sessions -> upload), back to back
+   with no idle time in between. The order is the one the data needs: the
+   attendance export writes the CSVs and the session titles, the LMS step
+   checks what is missing, makes sure every session exists on the LMS, and
+   only then uploads the attendance onto it.
+   A step that fails stops the run.
 ======================= */
 
 ipcMain.on('start-full-run', async (event, config) => {
@@ -333,10 +386,17 @@ ipcMain.on('start-full-run', async (event, config) => {
   logBuffer = [];
   logBufferSize = 0;
 
+  // The LMS step checks what is missing first, then creates / fixes the
+  // sessions and uploads the attendance, in one browser session.
+  // 4 stages in 2 processes: the export (stage 1), then one LMS run that
+  // checks (2), creates / edits every session (3) and uploads (4) in one
+  // browser session, printing its own stage lines.
   const steps = [
-    { title: 'Attendance export', build: () => attendanceStep(config) },
-    { title: 'Sync / Edit sessions', build: () => lmsEditStep(config) },
-    { title: 'Upload attendance', build: () => lmsUploadStep(config) },
+    { title: 'Stage 1/4: Attendance export', build: () => attendanceStep(config) },
+    {
+      title: 'Stages 2-4/4: Check missing -> Sync sessions -> Upload attendance',
+      build: () => lmsFastSyncStep(config, { step: 'all', fullRun: true }),
+    },
   ];
 
   let lastCode = 0;
@@ -347,7 +407,7 @@ ipcMain.on('start-full-run', async (event, config) => {
       if (chainCancelled) break;
 
       const { title, build } = steps[i];
-      event.reply('log', `\n${'='.repeat(70)}\n[FULL RUN] Step ${i + 1}/${steps.length}: ${title}\n${'='.repeat(70)}\n`);
+      event.reply('log', `\n${'='.repeat(70)}\n[FULL RUN] ${title}\n${'='.repeat(70)}\n`);
 
       let step;
       try {
@@ -362,15 +422,15 @@ ipcMain.on('start-full-run', async (event, config) => {
       lastCode = code;
 
       if (chainCancelled) {
-        event.reply('log', `\n[FULL RUN] Stopped by user after step ${i + 1}/${steps.length}.\n`);
+        event.reply('log', `\n[FULL RUN] Stopped by user during ${title}.\n`);
         break;
       }
 
       if (code !== 0) {
         event.reply(
           'log',
-          `\n[FULL RUN] Step ${i + 1}/${steps.length} (${title}) ended with code ${code}. ` +
-          `The remaining steps were not run — fix this one and start again.\n`
+          `\n[FULL RUN] ${title} ended with code ${code}. ` +
+          `The remaining stages were not run - fix this one and start again.\n`
         );
         break;
       }
@@ -378,9 +438,11 @@ ipcMain.on('start-full-run', async (event, config) => {
 
     if (!chainCancelled && lastCode === 0) {
       const minutes = ((Date.now() - startedAt) / 60000).toFixed(1);
-      event.reply('log', `\n${'='.repeat(70)}\n[FULL RUN] All 3 steps finished in ${minutes} minutes.\n${'='.repeat(70)}\n`);
+      event.reply('log', `\n${'='.repeat(70)}\n[FULL RUN] All 4 stages finished in ${minutes} minutes.\n${'='.repeat(70)}\n`);
     }
   } finally {
+    monitor.end(chainCancelled ? null : lastCode);
+    publishMonitor(event);
     chainRunning = false;
     chainCancelled = false;
     event.reply('process-ended', { code: lastCode, signal: null, taskId: 'full-run' });
@@ -463,4 +525,23 @@ ipcMain.handle('get-group-tracks', () => {
   return Object.fromEntries(
     readGroupsList().map((group) => [group, getGroupTrack(group)])
   );
+});
+
+ipcMain.handle('get-run-progress', () => monitor.state);
+ipcMain.handle('retry-session', (invokeEvent, id) => {
+  const event = { sender:invokeEvent.sender, reply:(channel,...args) => { if(!invokeEvent.sender.isDestroyed()) invokeEvent.sender.send(channel,...args); } };
+  if (currentProcess || chainRunning) return { ok: false, reason: 'Wait until the current run stops.' };
+  const found = monitor.find(id);
+  if (!found || !found.session.retryable) return { ok: false, reason: 'This session cannot be retried automatically.' };
+  const { group, session } = found;
+  if (!['error', 'interrupted'].some(status => Object.values(session.stages).includes(status))) return { ok:false, reason:'This session has no failed step.' };
+  const config = { groupFilter:group.name, trackFilter:group.track, dateFrom:session.date, dateTo:session.date,
+    retrySession:{ date:session.date, title:session.title } };
+  const step = session.stages.export === 'error' || session.stages.export === 'interrupted'
+    ? attendanceStep({...config,trackFilter:'all',retrySessionId:session.exportId})
+    : lmsFastSyncStep(config, { step:'all' });
+  step.options.retry = true;
+  monitor.start('session-retry', true);
+  runStep(event, step).then(({code,signal}) => broadcast('process-ended', {code,signal,taskId:'session-retry'}));
+  return { ok:true };
 });

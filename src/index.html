@@ -203,11 +203,22 @@
         <div class="panel-header">
           <div>
             <span class="section-tag">Live Feed</span>
-            <h2>Activity Log</h2>
-            <p class="section-copy">Real-time execution messages from the desktop automation engine.</p>
+            <h2>Run progress</h2>
+            <p class="section-copy">Groups, sessions and verified results in one place.</p>
           </div>
           <span class="log-count" id="logCount">(0)</span>
         </div>
+        <div class="monitor-tabs"><button id="openProgress" type="button" onclick="window.electron.openProgress()">Open full progress</button><button id="showMonitor" type="button">Groups &amp; sessions</button><button id="showActivity" type="button">Activity log</button></div>
+<section id="runMonitor" class="run-monitor" aria-label="Run progress">
+<div class="monitor-heading"><strong id="monitorRunStatus">Ready</strong><span id="monitorHeartbeat">No run yet</span></div>
+<p id="monitorCurrent" class="monitor-current"></p>
+<aside id="monitorRunning" class="monitor-running" aria-label="Current running work"></aside>
+<div id="monitorStages" class="monitor-stages"></div>
+<div id="monitorTracks" class="monitor-tracks"></div>
+<div class="monitor-filters"><input id="monitorSearch" class="text-input" placeholder="Search groups or session titles" aria-label="Search progress"><select id="monitorFilter" class="text-input" aria-label="Filter progress"><option value="all">All groups</option><option value="error">Errors / interrupted</option><option value="pending">Pending work</option><option value="done">Uploaded / up to date</option><option value="empty">No sessions in folder</option></select></div>
+<div id="monitorGroups" class="monitor-groups"></div>
+<div class="monitor-pagination"><button id="monitorPrev" type="button">Previous</button><span id="monitorPage"></span><button id="monitorNext" type="button">Next</button></div>
+</section>
         <div id="logViewer" class="log-viewer">
           <div class="log-entry initial">Ready to start...</div>
         </div>
@@ -220,5 +231,6 @@
   </div>
 
   <script src="app.js"></script>
+  <script src="monitor.js"></script>
 </body>
 </html>

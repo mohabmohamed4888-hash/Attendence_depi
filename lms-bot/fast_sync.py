@@ -42,7 +42,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import date, datetime
 
 
 def _apply_cli_args() -> argparse.Namespace:
@@ -53,6 +53,12 @@ def _apply_cli_args() -> argparse.Namespace:
     parser.add_argument("--track", help="technical | nontechnical | all")
     parser.add_argument("--groups", help="comma-separated group names")
     parser.add_argument("--round", help="round number, e.g. 5")
+    parser.add_argument(
+        "--step",
+        choices=["all", "sessions", "upload"],
+        default=os.getenv("FAST_SYNC_STEP", "all"),
+        help="sessions = create/fix sessions only, upload = upload attendance only, all = both",
+    )
     args = parser.parse_args()
     if args.track:
         os.environ["LMS_TRACK"] = args.track
@@ -73,8 +79,22 @@ from playwright.sync_api import sync_playwright  # noqa: E402
 import edit as E  # noqa: E402
 import lms_session  # noqa: E402
 import upload as U  # noqa: E402
+import progress_events as P
 
 PLAN_ONLY = ARGS.plan or E.DRY_RUN or U.DRY_RUN
+# Set by Run Everything: the export is stage 1, this script runs stages 2-4.
+FULL_RUN_STAGES = os.getenv("FULL_RUN_STAGES", "").strip() == "1"
+
+
+def print_stage(number, title, profile_name):
+    if FULL_RUN_STAGES:
+        print("\n" + "=" * 70)
+        print(f"[FULL RUN] Stage {number}/4: {title} ({profile_name})")
+        print("=" * 70)
+
+
+DO_SESSIONS = ARGS.step in ("all", "sessions")
+DO_UPLOADS = ARGS.step in ("all", "upload")
 SCAN_CONCURRENCY = max(1, int(os.getenv("FAST_SCAN_CONCURRENCY", "4")))
 PAUSE_MS = int(os.getenv("FAST_PAUSE_MS", "300"))
 # FAST_SYNC_HTTP=0 turns the direct form posts off (everything on screen).
@@ -87,6 +107,76 @@ PLAN_CSV_PATH = os.path.join(EXPORTS_ROOT, "lms_missing_sessions.csv")
 
 class BlockedError(RuntimeError):
     """The LMS firewall answered with its "page blocked" screen."""
+
+
+# The account the browser is signed in with, so a lost session can be renewed.
+CURRENT_ACCOUNT = {"email": "", "password": ""}
+
+# Errors that only mean the request was cut off (the page reloaded or the
+# connection dropped for a moment): reading again is safe.
+_TRANSIENT = (
+    "Execution context was destroyed",
+    "Failed to fetch",
+    "most likely because of a navigation",
+    "Cannot find context with specified id",
+    "NetworkError",
+    "net::ERR_",
+    # The LMS logged the account out (e.g. a saved login that expired):
+    # recover_page signs in again, then the request is sent again.
+    "LMS session expired",
+    # A request the LMS did not answer in time (fetch timeout).
+    "TimeoutError",
+    "signal timed out",
+)
+
+
+def is_transient(error) -> bool:
+    return any(s in str(error) for s in _TRANSIENT)
+
+
+def recover_page(page, attempt):
+    """Waits a little, lets the page settle and signs in again if needed."""
+    time.sleep(2 * attempt)
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=15000)
+    except Exception:
+        pass
+    try:
+        # Load a fresh page: a page left open can still show a session the
+        # LMS has already ended.
+        page.goto(f"{lms_session.LMS_BASE_URL}/my/")
+        E.wait_dom_ready(page)
+        if "login/index.php" in page.url.lower() or not lms_session.get_sesskey(page):
+            print("🔐 The LMS login expired; signing in again...")
+            E.ensure_logged_in(page, CURRENT_ACCOUNT["email"], CURRENT_ACCOUNT["password"])
+    except Exception as e:
+        print(f"⚠️ Could not settle the page yet: {e}")
+
+
+def evaluate_with_retry(page, js, arg, what, retries=3, result_error=lambda res: None):
+    """page.evaluate that survives a page reload / dropped connection.
+
+    Only for requests that are safe to send again (reads, uploads, edits).
+    result_error(res) returns the error text inside a result, if any.
+    """
+    last = None
+    for attempt in range(retries + 1):
+        if attempt:
+            print(f"⚠️ {what}: the request was cut off ({last}); trying again ({attempt}/{retries})...")
+            recover_page(page, attempt)
+        try:
+            res = page.evaluate(js, arg)
+        except Exception as e:
+            if not is_transient(e):
+                raise
+            last = e
+            continue
+        err = result_error(res)
+        if err and is_transient(err):
+            last = err
+            continue
+        return res
+    raise RuntimeError(f"{what}: {last}")
 
 
 # =========================
@@ -142,7 +232,17 @@ class State:
             tmp = STATE_PATH + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(self.data, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, STATE_PATH)
+            # Windows can hold the file for a moment (antivirus, a viewer):
+            # try again briefly, then write it in place.
+            for _ in range(5):
+                try:
+                    os.replace(tmp, STATE_PATH)
+                    return
+                except PermissionError:
+                    time.sleep(0.2)
+            with open(STATE_PATH, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, ensure_ascii=False, indent=2)
+            os.remove(tmp)
         except Exception as e:
             print(f"⚠️ Could not save {os.path.basename(STATE_PATH)}: {e}")
 
@@ -150,20 +250,37 @@ class State:
         self.data["current"] = {"group": group, "step": step, "session": session, "since": _now()}
         self.save()
 
-    def done(self, group, step, session):
-        self.data["done"].append({"group": group, "step": step, "session": session, "at": _now()})
+    def done(self, group, step, session, item=None):
+        self.data["done"].append(
+            {"group": group, "step": step, "session": session, "at": _now(), **_item_details(item)}
+        )
         self.save()
 
-    def failed(self, group, step, session, reason):
-        self.data["failed"].append(
-            {"group": group, "step": step, "session": session, "reason": str(reason)[:300], "at": _now()}
-        )
+    def failed(self, group, step, session, reason, item=None):
+        self.data["failed"].append({
+            "group": group, "step": step, "session": session, "reason": str(reason)[:300],
+            "at": _now(), **_item_details(item),
+        })
         self.save()
 
     def finish(self):
         self.data["finished"] = True
         self.data["current"] = None
         self.save()
+
+
+def _item_details(item):
+    """What the Excel report shows for one session (see write_results_excel)."""
+    if not item:
+        return {}
+    d = item.get("date")
+    return {
+        "profile": (E._PROFILE or {}).get("name", ""),
+        "date": d.isoformat() if d else "",
+        "time": f"{item['start']}-{item['end']}" if item.get("start") else "",
+        "title": str(item.get("title", "")),
+        "csv_file": os.path.basename(item.get("csv_path", "") or ""),
+    }
 
 
 def _now():
@@ -193,7 +310,7 @@ _SCAN_JS = """async ([urls, concurrency]) => {
   const label = (a) => `${a.getAttribute('aria-label') || ''} ${a.getAttribute('title') || ''}`.toLowerCase();
   async function one(i) {
     try {
-      const r = await fetch(urls[i], { credentials: 'include' });
+      const r = await fetch(urls[i], { credentials: 'include', signal: AbortSignal.timeout(60000) });
       const html = await r.text();
       if (html.includes('has been blocked') && html.includes('Attack ID')) { out[i] = { error: 'blocked' }; return; }
       if (r.url.includes('/login/index.php')) { out[i] = { error: 'login' }; return; }
@@ -237,7 +354,17 @@ def scan_tables(page, urls):
     """Returns one list of rows per URL (same keys as parse_sessions_table)."""
     if not urls:
         return []
-    results = page.evaluate(_SCAN_JS, [list(urls), SCAN_CONCURRENCY])
+    results = evaluate_with_retry(
+        page, _SCAN_JS, [list(urls), SCAN_CONCURRENCY], "reading the sessions tables",
+        result_error=lambda res: next(
+            ("the LMS session expired (login page)" if r.get("error") == "login"
+             else f"NetworkError: the LMS server answered HTTP {r.get('status')}" if (r.get("status") or 0) >= 500
+             else r.get("error")
+             for r in res or []
+             if r and (r.get("error") == "login" or is_transient(r.get("error", "")) or (r.get("status") or 0) >= 500)),
+            None,
+        ),
+    )
     tables = []
     for url, res in zip(urls, results):
         err = (res or {}).get("error")
@@ -305,10 +432,48 @@ def use_profiles(track):
     U._PROFILE = upload_profile_for(track)
 
 
-def groups_for_track(track):
-    """Groups that have a titles CSV and/or an attendance folder, with their LMS number."""
+_GROUP_LIST_JS = """async (urls) => Promise.all(urls.map(async (url) => {
+  try {
+    const r = await fetch(url, { credentials: 'include', signal: AbortSignal.timeout(60000) });
+    const html = await r.text();
+    if (html.includes('has been blocked') && html.includes('Attack ID')) return { blocked: true };
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const out = {};
+    for (const o of doc.querySelectorAll('select[name=group] option')) {
+      const m = (o.textContent || '').trim().match(/^Group:\\s*(\\S+)$/i);
+      if (m && Number(o.value) > 0) out[m[1]] = Number(o.value);
+    }
+    return { groups: out };
+  } catch (e) {
+    return { groups: {} };
+  }
+}))"""
+
+
+def course_module_ids(track):
+    if E.COURSE_MODULE_ID_OVERRIDE:
+        return [str(E.COURSE_MODULE_ID_OVERRIDE)]
+    ep = edit_profile_for(track)
+    return [str(ep["COURSE_MODULE_ID"]), str(ep["ROUND_5_COURSE_MODULE_ID"])]
+
+
+def lms_group_numbers(page, track):
+    """{course module id: {group name: LMS group number}} from the LMS group list."""
+    cmids = course_module_ids(track)
+    urls = [f"{lms_session.LMS_BASE_URL}/mod/attendance/manage.php?id={c}&view={E.VIEW}" for c in cmids]
+    results = evaluate_with_retry(page, _GROUP_LIST_JS, urls, "reading the LMS group list")
+    if any(r.get("blocked") for r in results):
+        raise BlockedError(
+            "The LMS firewall blocked a request (\"Web Page Blocked\"). Stopped; wait a "
+            "while before running again."
+        )
+    return {c: (r.get("groups") or {}) for c, r in zip(cmids, results)}
+
+
+def group_names_for_track(track):
+    """Groups that have a titles CSV and/or an attendance folder."""
     ep, up = edit_profile_for(track), upload_profile_for(track)
-    names = set()
+    names = set(up["GROUP_TO_NUM"]) | set(ep["GROUP_TO_NUM"])
     titles_dir = ep["CSV_DIR"]
     if os.path.isdir(titles_dir):
         for fname in os.listdir(titles_dir):
@@ -324,10 +489,30 @@ def groups_for_track(track):
         names = {n for n in names if re.match(r"^[A-Za-z]{3,4}" + re.escape(E.LMS_ROUND), n)}
     if E.ONLY_GROUPS:
         names = {n for n in names if n in E.ONLY_GROUPS}
+        names.update(n for n in E.ONLY_GROUPS if n in up["GROUP_TO_NUM"] or n in ep["GROUP_TO_NUM"])
+    return sorted(names)
 
+
+def groups_for_track(track, names, lms_numbers=None):
+    """Each group with its LMS group number.
+
+    The number comes from the LMS's own group list when it has the group (so a
+    group missing from the bots' lists is never skipped); the lists in
+    upload.py / edit.py are the fallback.
+    """
+    ep, up = edit_profile_for(track), upload_profile_for(track)
+    titles_dir = ep["CSV_DIR"]
+    lms_numbers = lms_numbers or {}
     mapped, unmapped = [], []
-    for name in sorted(names):
-        num = up["GROUP_TO_NUM"].get(name) or ep["GROUP_TO_NUM"].get(name)
+    for name in names:
+        listed = up["GROUP_TO_NUM"].get(name) or ep["GROUP_TO_NUM"].get(name)
+        cmid = cmid_from_url(U.build_target_url(listed or 0, name))
+        on_lms = (lms_numbers.get(cmid) or {}).get(name)
+        if on_lms and listed and int(listed) != int(on_lms):
+            print(f"ℹ️ {name}: the LMS lists it as group {on_lms} (the bot list says {listed}); using {on_lms}.")
+        elif on_lms and not listed:
+            print(f"ℹ️ {name}: not in the bot lists; found on the LMS as group {on_lms}.")
+        num = on_lms or listed
         if num:
             titles_csv = os.path.join(titles_dir, f"{name}.csv")
             if not os.path.isfile(titles_csv):
@@ -349,51 +534,73 @@ def plan_titles(group, lms_sessions):
     """What edit.py would do for this group's titles CSV, decided up front."""
     actions, notes = [], []
     if not group["titles_csv"]:
-        return actions, notes
+        return P.select(actions), P.select(notes)
     rows_csv = E.read_csv_rows(group["titles_csv"])
     if not rows_csv:
-        return actions, notes
+        return P.select(actions), P.select(notes)
     target_dates = E.build_target_dates_with_rollover(rows_csv)
 
-    claimed, planned = set(), set()
+    items = []
     for idx, item in enumerate(rows_csv, start=1):
         title = item.get("title", "").strip()
-        target_date = target_dates[idx - 1]
         start24, end24 = E.extract_time_range_from_title(title)
-        base = {"date": target_date, "start": start24, "end": end24, "title": title, "csv_row": idx}
+        base = {"date": target_dates[idx - 1], "start": start24, "end": end24, "title": title, "csv_row": idx}
         if not start24 or not end24:
-            notes.append({**base, "action": "skip", "reason": "could not parse time from title"})
+            notes.append({**base, "action": "problem", "reason": "the title in CSV Titles has no time range (e.g. 6:00 pm - 9:00 pm); fix the title and run again"})
             continue
-        key = (target_date, start24, end24, E.normalize_text(title))
-        exact = E.find_exact_match(lms_sessions, target_date, title, start24, end24)
-        if exact or key in planned:
-            if exact:
-                claimed.add(exact["key"])
-            continue
-        candidate, how = E.choose_lms_session(lms_sessions, target_date, start24, end24, claimed)
+        items.append(base)
+
+    # Pass 1: every CSV row that is already exactly on the LMS claims its
+    # session first, so pass 2 can never move a session another row needs.
+    claimed, rest, seen = set(), [], set()
+    for base in items:
+        key = (base["date"], base["start"], base["end"], E.normalize_text(base["title"]))
+        exact = next(
+            (s for s in lms_sessions
+             if s["key"] not in claimed
+             and E.is_same_session_exact(s, base["date"], base["title"], base["start"], base["end"])),
+            None,
+        )
+        if exact:
+            claimed.add(exact["key"])
+        elif key in seen:
+            pass  # the same row twice in CSV Titles: one session is enough
+        else:
+            rest.append(base)
+        seen.add(key)
+
+    # Pass 2: fix a session on the same day (same time first), or create it.
+    for base in rest:
+        candidate, how = E.choose_lms_session(lms_sessions, base["date"], base["start"], base["end"], claimed)
         if how == "conflict":
-            notes.append({**base, "action": "skip", "reason": "another CSV row already matched the LMS session at this date/time"})
+            # Two CSV rows want the same date and time with different titles.
+            notes.append({**base, "action": "problem", "reason": "two rows in CSV Titles have this date and time with different titles; fix CSV Titles"})
             continue
         if candidate:
             claimed.add(candidate["key"])
-            if candidate["title_norm"] == E.normalize_text(title):
-                continue
+            reason = ""
             if candidate.get("attendance_taken"):
-                notes.append({**base, "action": "skip", "reason": "title differs but attendance already taken; left as is"})
-                continue
-            actions.append({**base, "action": "edit", "candidate": candidate})
+                # Same session (nothing else in CSV Titles claims it): only its
+                # title/time are corrected, the attendance on it stays.
+                reason = "attendance already taken; only the title/time are corrected, the attendance stays"
+            actions.append({**base, "action": "edit", "candidate": candidate, "reason": reason})
         else:
-            planned.add(key)
             actions.append({**base, "action": "create"})
-    return actions, notes
+    return P.select(actions), P.select(notes)
 
 
-def plan_uploads(group, rows):
-    """What upload.py would do for this group, decided up front."""
+def plan_uploads(group, rows, planned_csvs=()):
+    """What upload.py would do for this group, decided up front.
+
+    Every attendance CSV in the group's folder must end up on an LMS session:
+    one that is not matched by any LMS row (or by a session about to be
+    created, planned_csvs) is reported instead of being silently left out.
+    """
     actions, notes = [], []
+    covered = {os.path.normcase(os.path.abspath(p)) for p in planned_csvs if p}
     csv_start, csv_end = U.get_csv_date_range_for_group(group["name"])
     if csv_start is None and not U.GLOBAL_START_FROM_DATE:
-        return actions, notes
+        return P.select(actions), P.select(notes)
     start_from = U.GLOBAL_START_FROM_DATE or csv_start
 
     for row in rows:
@@ -401,17 +608,15 @@ def plan_uploads(group, rows):
         if not text:
             continue
         row_date = U.extract_date_from_row_text(text)
-        if start_from and (row_date is None or row_date < start_from):
+        if not row_date:
+            if not row["attendance_taken"]:
+                notes.append({"date": None, "action": "problem", "title": text[:120], "reason": "could not read the date of this LMS row"})
             continue
-        if csv_end and row_date and row_date > csv_end:
+        if start_from and row_date < start_from:
+            continue
+        if csv_end and row_date > csv_end:
             continue
         taken = row["attendance_taken"]
-        if not taken and not row["take_href"]:
-            continue
-        if not row_date:
-            if not taken:
-                notes.append({"date": None, "action": "skip", "title": text[:120], "reason": "could not parse the LMS row date"})
-            continue
         row_group = U.extract_group_from_row_text(text) or group["name"]
         session_title = U.extract_session_title_from_row_text(text)
         session_type = U.extract_session_type_from_title(session_title)
@@ -420,7 +625,11 @@ def plan_uploads(group, rows):
             csv_path = U.find_csv_for_session(row_group, row_date, session_type)
         except RuntimeError as e:
             if not taken:
-                notes.append({**base, "action": "skip", "reason": f"no attendance CSV: {e}"})
+                notes.append({**base, "action": "problem", "reason": f"no attendance CSV for this LMS session: {e}"})
+            continue
+        covered.add(os.path.normcase(os.path.abspath(csv_path)))
+        if not taken and not row["take_href"]:
+            notes.append({**base, "action": "problem", "csv_path": csv_path, "reason": "the LMS row has no Take attendance link"})
             continue
         key = U.pending_reupload_key(csv_path)
         if taken:
@@ -429,7 +638,25 @@ def plan_uploads(group, rows):
                 actions.append({**base, "action": "reupload", "csv_path": csv_path, "href": row["change_href"], "reason": reason})
             continue
         actions.append({**base, "action": "upload", "csv_path": csv_path, "href": row["take_href"]})
-    return actions, notes
+
+    group_dir = os.path.join(U._p("EXPORTS_BASE_DIR"), group["name"])
+    date_re = re.compile(r"^(\d{4})_(\d{2})_(\d{2})")
+    for fname in sorted(os.listdir(group_dir)) if os.path.isdir(group_dir) else []:
+        m = date_re.match(fname)
+        if not fname.lower().endswith(".csv") or not m:
+            continue
+        d = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        if start_from and d < start_from:
+            continue
+        path = os.path.join(group_dir, fname)
+        if os.path.normcase(os.path.abspath(path)) in covered:
+            continue
+        notes.append({
+            "date": d, "action": "problem", "title": fname, "csv_path": path,
+            "reason": "this attendance CSV has no session on the LMS"
+            + (" yet: it is created by Sync / Edit Sessions" if group.get("titles_csv") else " and no row in CSV Titles"),
+        })
+    return P.select(actions), P.select(notes)
 
 
 def describe(item):
@@ -438,6 +665,111 @@ def describe(item):
     if item.get("start"):
         when += f" {item['start']}-{item['end']}"
     return f"{when} | {str(item.get('title', ''))[:70]}"
+
+
+_ACTION_LABELS = {
+    "create": "Created",
+    "edit": "Edited",
+    "upload": "Uploaded",
+    "reupload": "Re-uploaded",
+}
+
+
+def write_results_excel(state):
+    """exports/uploaded_sessions_<dates>_<time>.xlsx: what this run did.
+
+    Summary (totals per track), Done (every session created / edited /
+    uploaded, verified on the LMS) and Failed. Next to the dashboard's
+    skipped_sessions report, which lists what could not be exported.
+    """
+    done, failed = state.data.get("done") or [], state.data.get("failed") or []
+    if not done and not failed:
+        print("📊 Nothing was created or uploaded in this run, so no uploaded-sessions report.")
+        return None
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        print("⚠️ openpyxl is not installed (pip install openpyxl): no Excel report.")
+        return None
+
+    bold = Font(bold=True)
+    head_fill = PatternFill("solid", fgColor="DDEBF7")
+
+    def sheet(ws, header, rows, widths):
+        ws.append(header)
+        for cell in ws[1]:
+            cell.font, cell.fill = bold, head_fill
+        for row in rows:
+            ws.append(row)
+        for i, w in enumerate(widths, start=1):
+            ws.column_dimensions[get_column_letter(i)].width = w
+        ws.freeze_panes = "A2"
+        if rows:
+            ws.auto_filter.ref = f"A1:{get_column_letter(len(header))}{len(rows) + 1}"
+
+    wb = Workbook()
+
+    # ---- Summary: totals per track ----
+    profiles = sorted({r.get("profile") or "" for r in done + failed}) or [""]
+    summary = []
+    for prof in profiles:
+        rows = [r for r in done if (r.get("profile") or "") == prof]
+        counts = {k: sum(1 for r in rows if r["step"] == k) for k in _ACTION_LABELS}
+        summary.append([
+            prof or "-", counts["create"], counts["edit"], counts["upload"], counts["reupload"],
+            counts["upload"] + counts["reupload"],
+            sum(1 for r in failed if (r.get("profile") or "") == prof),
+        ])
+    summary.append([
+        "TOTAL", *[sum(r[i] for r in summary) for i in range(1, 7)],
+    ])
+    ws = wb.active
+    ws.title = "Summary"
+    sheet(ws, ["Track", "Created", "Edited", "Uploaded", "Re-uploaded", "Total uploaded", "Failed"], summary,
+          [16, 10, 10, 10, 13, 15, 10])
+    for cell in ws[ws.max_row]:
+        cell.font = bold
+    ws.append([])
+    ws.append(["Run started", state.data.get("startedAt", "")])
+    ws.append(["Run ended", _now()])
+
+    # ---- Done / Failed: one row per session ----
+    sheet(
+        wb.create_sheet("Done"),
+        ["#", "Track", "Group", "Date", "Time", "Action", "Session title", "CSV file", "Done at"],
+        [[i, r.get("profile", ""), r["group"], r.get("date", ""), r.get("time", ""),
+          _ACTION_LABELS.get(r["step"], r["step"]), r.get("title") or r.get("session", ""),
+          r.get("csv_file", ""), r["at"].replace("T", " ")]
+         for i, r in enumerate(sorted(done, key=lambda r: (r.get("profile", ""), r["group"], r.get("date", ""))), start=1)],
+        [5, 15, 16, 12, 12, 12, 60, 42, 20],
+    )
+    sheet(
+        wb.create_sheet("Failed"),
+        ["#", "Track", "Group", "Date", "Time", "Action", "Session title", "CSV file", "Reason", "At"],
+        [[i, r.get("profile", ""), r["group"], r.get("date", ""), r.get("time", ""),
+          str(r["step"]).capitalize(), r.get("title") or r.get("session", ""),
+          r.get("csv_file", ""), r.get("reason", ""), r["at"].replace("T", " ")]
+         for i, r in enumerate(failed, start=1)],
+        [5, 15, 16, 12, 12, 12, 60, 42, 60, 20],
+    )
+
+    start, end = os.getenv("START_FROM_DATE", "").strip(), os.getenv("END_AT_DATE", "").strip()
+    dates = f"{start.replace('-', '_')}_to_{end.replace('-', '_')}_" if start and end else ""
+    path = os.path.join(EXPORTS_ROOT, f"uploaded_sessions_{dates}{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx")
+    try:
+        wb.save(path)
+    except Exception as e:
+        print(f"⚠️ Could not save the uploaded-sessions report (is it open in Excel?): {e}")
+        return None
+    t = summary[-1]
+    print(
+        f"📊 Uploaded-sessions report: {path}\n"
+        f"   TOTAL: created={t[1]} | edited={t[2]} | uploaded={t[3]} | re-uploaded={t[4]} | "
+        f"total uploaded={t[5]} | failed={t[6]}"
+    )
+    return path
 
 
 def write_plan_csv(plan_rows):
@@ -458,7 +790,11 @@ def plan_row(profile_name, group_name, item):
     return {
         "profile": profile_name,
         "group": group_name,
-        "action": "create + upload" if item["action"] == "create" and item.get("csv_path") else item["action"],
+        "action": (
+            f"{item['action']} + upload" if item["action"] in ("create", "edit") and item.get("csv_path")
+            else f"{item['action']} only" if item["action"] in ("create", "edit", "upload")
+            else item["action"]
+        ),
         "date": d.isoformat() if d else "",
         "time": f"{item['start']}-{item['end']}" if item.get("start") else "",
         "title_or_type": item.get("title", ""),
@@ -532,11 +868,11 @@ _HTTP_COMMON_JS = """
   const texts = (doc, sel) => Array.from(doc.querySelectorAll(sel))
     .map((e) => (e.textContent || '').replace(/\\s+/g, ' ').trim()).filter(Boolean);
   const get = async (url) => {
-    const r = await fetch(url, { credentials: 'include' });
+    const r = await fetch(url, { credentials: 'include', signal: AbortSignal.timeout(60000) });
     return { url: r.url, status: r.status, html: await r.text() };
   };
   const post = async (url, body) => {
-    const r = await fetch(url, { method: 'POST', body, credentials: 'include' });
+    const r = await fetch(url, { method: 'POST', body, credentials: 'include', signal: AbortSignal.timeout(120000) });
     return { url: r.url, status: r.status, html: await r.text() };
   };
   const check = (res, what) => {
@@ -547,22 +883,25 @@ _HTTP_COMMON_JS = """
   };
 """
 
-_HTTP_CREATE_JS = """async ([addUrl, groupValue, groupName, y, m, d, sh, sm, eh, em, descHtml]) => {
+# Add session (marker addsession, with the group) and Edit session (marker
+# updatesession, the group stays as it is) are the same Moodle form.
+_HTTP_SESSION_FORM_JS = """async ([formUrl, marker, groupValue, groupName, y, m, d, sh, sm, eh, em, descHtml]) => {
 """ + _HTTP_COMMON_JS + """
   try {
-    const doc = check(await get(addUrl), 'add-session form');
+    const doc = check(await get(formUrl), 'session form');
     const form = Array.from(doc.querySelectorAll('form'))
-      .find((f) => f.querySelector('[name=_qf__mod_attendance_form_addsession]'));
-    if (!form) return { error: 'the Add session form was not found' };
-    const select = form.querySelector('select[name="groups[]"]');
-    const options = select ? Array.from(select.options) : [];
-    const option = options.find((o) => o.value === String(groupValue))
-      || options.find((o) => o.textContent.trim() === groupName);
-    if (!option) return { error: `group ${groupName} is not in the form's group list` };
-
+      .find((f) => f.querySelector(`[name=${marker}]`));
+    if (!form) return { error: 'the session form was not found' };
     const fd = new FormData(form);
-    fd.delete('groups[]');
-    fd.append('groups[]', option.value);
+    if (groupValue !== null) {
+      const select = form.querySelector('select[name="groups[]"]');
+      const options = select ? Array.from(select.options) : [];
+      const option = options.find((o) => o.value === String(groupValue))
+        || options.find((o) => o.textContent.trim() === groupName);
+      if (!option) return { error: `group ${groupName} is not in the form's group list` };
+      fd.delete('groups[]');
+      fd.append('groups[]', option.value);
+    }
     const values = {
       'sessiondate[day]': d, 'sessiondate[month]': m, 'sessiondate[year]': y,
       'sestime[starthour]': sh, 'sestime[startminute]': sm,
@@ -574,7 +913,7 @@ _HTTP_CREATE_JS = """async ([addUrl, groupValue, groupName, y, m, d, sh, sm, eh,
 
     const res = await post(form.getAttribute('action'), fd);
     const out = check(res, 'saving the session');
-    if (out.querySelector('[name=_qf__mod_attendance_form_addsession]')) {
+    if (out.querySelector(`[name=${marker}]`)) {
       const errors = texts(out, '.invalid-feedback, .error, .alert-danger');
       return { error: 'the LMS refused the form: ' + (errors.join(' | ') || 'no message') };
     }
@@ -677,24 +1016,46 @@ def _http_result(res, what):
     return res
 
 
-def http_create(page, group, target_url, item):
-    group_value = E._PROFILE.get("GROUP_OPTION_VALUES", {}).get(group["name"], group["num"])
+def _http_session_form(page, form_url, marker, group_value, group_name, item, what):
     sh, sm = map(int, item["start"].split(":"))
     eh, em = map(int, item["end"].split(":"))
     d = item["date"]
     desc = "<p>" + html.escape(item["title"], quote=False) + "</p>"
+    args = [form_url, marker, group_value, group_name, d.year, d.month, d.day, sh, sm, eh, em, desc]
+    if group_value is None:
+        # An edit sets the same values again, so it is safe to repeat.
+        res = evaluate_with_retry(page, _HTTP_SESSION_FORM_JS, args, what, result_error=lambda r: r.get("error"))
+    else:
+        # A create is not sent twice: the check after it tells whether it was saved.
+        res = page.evaluate(_HTTP_SESSION_FORM_JS, args)
+    _http_result(res, what)
+
+
+def http_create(page, group, target_url, item):
+    # The LMS group number is what the form's group list uses.
     add_url = f"{lms_session.LMS_BASE_URL}/mod/attendance/sessions.php?id={cmid_from_url(target_url)}&action=1"
-    res = page.evaluate(
-        _HTTP_CREATE_JS,
-        [add_url, str(group_value), group["name"], d.year, d.month, d.day, sh, sm, eh, em, desc],
+    _http_session_form(
+        page, add_url, "_qf__mod_attendance_form_addsession",
+        str(group["num"]), group["name"], item, "direct create",
     )
-    _http_result(res, "direct create")
+
+
+def http_edit(page, item):
+    href = item["candidate"].get("edit_href")
+    if not href:
+        raise RuntimeError("direct edit: the LMS row has no Edit link")
+    _http_session_form(
+        page, href, "_qf__mod_attendance_form_updatesession", None, "", item, "direct edit",
+    )
 
 
 def http_upload(page, item):
     with open(item["csv_path"], "rb") as f:
         data = base64.b64encode(f.read()).decode("ascii")
-    res = page.evaluate(_HTTP_UPLOAD_JS, [item["href"], os.path.basename(item["csv_path"]), data])
+    res = evaluate_with_retry(
+        page, _HTTP_UPLOAD_JS, [item["href"], os.path.basename(item["csv_path"]), data],
+        "direct upload", result_error=lambda r: r.get("error"),
+    )
     _http_result(res, "direct upload")
     U.collect_missing_from_wavz(_AlertTexts(res.get("alerts")), item["row_group"], item["csv_path"])
 
@@ -702,130 +1063,172 @@ def http_upload(page, item):
 # =========================
 # ONE GROUP
 # =========================
-def sync_group(page, state, profile_name, group, target_url, rows, title_actions):
-    name = group["name"]
-    stats = {"created": 0, "edited": 0, "uploaded": 0, "reuploaded": 0, "failed": 0}
-    started = time.time()
-    print("\n" + "=" * 100)
-    print(f"🧩 {profile_name} | {name} | {target_url}")
-    print("=" * 100)
+def _run_session_item(page, group, target_url, item, direct):
+    if item["action"] == "create":
+        print(f"➕ Creating{'' if direct else ' (on screen)'}: {describe(item)}")
+        if direct:
+            http_create(page, group, target_url, item)
+        else:
+            do_create(page, group, target_url, item)
+    else:
+        note = " (attendance on it stays)" if item.get("candidate", {}).get("attendance_taken") else ""
+        print(f"✏️ Fixing{'' if direct else ' (on screen)'}{note}: {describe(item)}")
+        if direct:
+            http_edit(page, item)
+        else:
+            do_edit(page, target_url, item)
 
-    # 1) Create / fix the sessions.
-    for item in title_actions:
-        label = describe(item)
-        state.at(name, item["action"], label)
-        # A create is tried once with a direct form post and, if that fails,
-        # once on screen; an edit is done on screen.
-        attempts = 2 if item["action"] == "create" else 1
-        for attempt in range(1, attempts + 1):
+
+def _run_upload_item(page, item, direct):
+    verb = "♻️ Re-uploading" if item["action"] == "reupload" else "⬆️ Uploading"
+    print(f"{verb}{'' if direct else ' (on screen)'}: {describe(item)} <- {os.path.basename(item['csv_path'])}")
+    if direct:
+        http_upload(page, item)
+    else:
+        do_upload(page, item)
+
+
+def sync_sessions(page, state, group, target_url, title_actions, stats):
+    """Creates / fixes the sessions, verifies them on the LMS and tries every
+    miss once more on screen. Returns the fresh table rows."""
+    name = group["name"]
+    pending = list(title_actions)
+    rows = None
+    for round_no in (1, 2):
+        direct = USE_HTTP and round_no == 1
+        for item in pending:
+            state.at(name, item["action"], describe(item))
+            P.session(name, item, "sync", "running")
+            t = time.time()
             try:
-                t = time.time()
-                if item["action"] == "create":
-                    direct = USE_HTTP and attempt == 1
-                    print(f"➕ Creating{'' if direct else ' (on screen)'}: {label}")
-                    if direct:
-                        http_create(page, group, target_url, item)
-                    else:
-                        do_create(page, group, target_url, item)
-                else:
-                    print(f"✏️ Editing: {label}")
-                    do_edit(page, target_url, item)
+                _run_session_item(page, group, target_url, item, direct)
                 print(f"   saved in {time.time() - t:.1f}s")
-                break
             except BlockedError:
                 raise
             except Exception as e:
-                print(f"❌ {item['action']} failed (attempt {attempt}): {e}")
-                # Before trying again, check the LMS: the session may have been
-                # saved even though the page did not finish loading.
-                fresh = lms_sessions_from_rows(scan_tables(page, [target_url])[0])
-                if E.find_exact_match(fresh, item["date"], item["title"], item["start"], item["end"]):
-                    print("ℹ️ The LMS already has it, so it is counted as done.")
-                    break
-                if attempt == attempts:
-                    stats["failed"] += 1
-                    state.failed(name, item["action"], label, e)
-                    item["failed"] = True
-        page.wait_for_timeout(PAUSE_MS)
+                item["error"] = str(e)
+                print(f"⚠️ {e}")
+            page.wait_for_timeout(PAUSE_MS)
 
-    # 2) One fresh read verifies every change and gives the new sessions'
-    #    links for the uploads.
-    if title_actions:
+        # One fresh read verifies every change (and gives the new sessions'
+        # links for the uploads).
         rows = scan_tables(page, [target_url])[0]
         fresh = lms_sessions_from_rows(rows)
-        for item in title_actions:
-            if item.get("failed"):
-                continue
-            label = describe(item)
-            if E.find_exact_match(fresh, item["date"], item["title"], item["start"], item["end"]):
+        claimed = set()
+        missing = []
+        for item in pending:
+            found = next(
+                (s for s in fresh if s["key"] not in claimed
+                 and E.is_same_session_exact(s, item["date"], item["title"], item["start"], item["end"])),
+                None,
+            )
+            if found:
+                claimed.add(found["key"])
                 stats["created" if item["action"] == "create" else "edited"] += 1
-                state.done(name, item["action"], label)
+                state.done(name, item["action"], describe(item), item=item)
+                P.session(name, item, "sync" if item["action"] in ("create", "edit") else "upload", "done")
             else:
+                missing.append(item)
+        if not missing:
+            break
+        if round_no == 1:
+            print(f"🔁 {len(missing)} session(s) not right on the LMS yet; trying them again on screen.")
+            for item in missing:
+                if item["action"] == "create":
+                    # If the first try did save something at that date and
+                    # time, fix that session instead of adding a second one.
+                    candidate, how = E.choose_lms_session(fresh, item["date"], item["start"], item["end"], claimed)
+                    if how == "time":
+                        claimed.add(candidate["key"])
+                        item["action"], item["candidate"] = "edit", candidate
+            pending = missing
+        else:
+            for item in missing:
                 stats["failed"] += 1
-                print(f"❌ Not found on the LMS after the {item['action']}: {label}")
-                state.failed(name, item["action"], label, "not found on the LMS after saving")
+                reason = item.get("error") or "not found on the LMS after saving"
+                print(f"❌ Could not {item['action']} {describe(item)}: {reason}")
+                state.failed(name, item["action"], describe(item), reason, item=item)
+                P.session(name, item, "sync" if item["action"] in ("create", "edit") else "upload", "error", reason)
+    return rows
 
-    # 3) Upload the attendance that is still missing.
-    upload_actions, _ = plan_uploads(group, rows)
-    for item in upload_actions:
-        label = describe(item)
-        state.at(name, item["action"], f"{label} | {os.path.basename(item['csv_path'])}")
-        try:
-            print(f"{'♻️ Re-uploading' if item['action'] == 'reupload' else '⬆️ Uploading'}: {label} <- {os.path.basename(item['csv_path'])}")
+
+def sync_uploads(page, state, group, target_url, rows, stats):
+    """Uploads the missing attendance, verifies it on the LMS and tries every
+    miss once more on screen. Returns the problems found while planning."""
+    name = group["name"]
+    upload_actions, notes = plan_uploads(group, rows)
+    pending = list(upload_actions)
+    for round_no in (1, 2):
+        if not pending:
+            break
+        direct = USE_HTTP and round_no == 1
+        for item in pending:
+            state.at(name, item["action"], f"{describe(item)} | {os.path.basename(item['csv_path'])}")
+            P.session(name, item, "upload", "running")
             t = time.time()
-            done_direct = False
-            if USE_HTTP:
-                try:
-                    http_upload(page, item)
-                    done_direct = True
-                except BlockedError:
-                    raise
-                except Exception as e:
-                    # Uploading the same CSV again only rewrites the same marks,
-                    # so the on-screen upload is safe even if this one got far.
-                    print(f"⚠️ {e} -> uploading on screen instead")
-            if not done_direct:
-                do_upload(page, item)
-            print(f"   uploaded in {time.time() - t:.1f}s")
-            key = U.pending_reupload_key(item["csv_path"])
-            item["pending"] = (key, U.PENDING_REUPLOADS.pop(key, None))
-            if item["pending"][1] is not None:
-                U.save_pending_reuploads()
-        except BlockedError:
-            raise
-        except Exception as e:
-            stats["failed"] += 1
-            item["failed"] = True
-            print(f"❌ Upload failed: {e}")
-            state.failed(name, item["action"], label, e)
-        page.wait_for_timeout(PAUSE_MS)
+            try:
+                _run_upload_item(page, item, direct)
+                print(f"   uploaded in {time.time() - t:.1f}s")
+                key = U.pending_reupload_key(item["csv_path"])
+                info = U.PENDING_REUPLOADS.pop(key, None)
+                if info is not None:
+                    item["pending"] = (key, info)
+                    U.save_pending_reuploads()
+            except BlockedError:
+                raise
+            except Exception as e:
+                # Uploading the same CSV again only rewrites the same marks,
+                # so trying again is always safe.
+                item["error"] = str(e)
+                print(f"⚠️ {e}")
+            page.wait_for_timeout(PAUSE_MS)
 
-    # 4) One fresh read verifies every upload.
-    if any(not i.get("failed") for i in upload_actions):
         after = {r["session_id"]: r for r in scan_tables(page, [target_url])[0] if r["session_id"]}
-        for item in upload_actions:
-            if item.get("failed"):
-                continue
-            label = describe(item)
+        missing = []
+        for item in pending:
             row = after.get(item["session_id"])
-            if row and row["attendance_taken"]:
+            if row and row["attendance_taken"] and not item.get("error"):
                 stats["reuploaded" if item["action"] == "reupload" else "uploaded"] += 1
-                state.done(name, item["action"], label)
+                state.done(name, item["action"], describe(item), item=item)
+                P.session(name, item, "sync" if item["action"] in ("create", "edit") else "upload", "done")
             else:
+                if row and row.get("change_href"):
+                    item["href"] = row["change_href"]
+                missing.append(item)
+        if missing and round_no == 1:
+            print(f"🔁 {len(missing)} upload(s) not confirmed; trying them again on screen.")
+            for item in missing:
+                item.pop("error", None)
+        elif missing:
+            for item in missing:
                 stats["failed"] += 1
-                print(f"❌ Attendance not shown as taken after the upload: {label}")
-                state.failed(name, item["action"], label, "attendance not shown as taken after the upload")
+                reason = item.get("error") or "attendance not shown as taken after the upload"
+                print(f"❌ Could not upload {describe(item)}: {reason}")
+                state.failed(name, item["action"], describe(item), reason, item=item)
+                P.session(name, item, "sync" if item["action"] in ("create", "edit") else "upload", "error", reason)
                 key, info = item.get("pending") or (None, None)
                 if info is not None:
                     U.PENDING_REUPLOADS[key] = info
                     U.save_pending_reuploads()
+        pending = missing
+    return notes
 
+
+def new_stats():
+    return {"created": 0, "edited": 0, "uploaded": 0, "reuploaded": 0, "failed": 0}
+
+
+def add_stats(totals, stats):
+    for k in totals:
+        totals[k] += stats[k]
+
+
+def print_group_done(name, stats, started):
     print(
         f"✅ DONE {name} | created={stats['created']} | edited={stats['edited']} | "
         f"uploaded={stats['uploaded']} | reuploaded={stats['reuploaded']} | failed={stats['failed']} "
         f"| {time.time() - started:.1f}s"
     )
-    return stats
 
 
 # =========================
@@ -846,6 +1249,7 @@ def open_browser(p, email, password):
     page = context.new_page()
     page.set_default_timeout(E.DEFAULT_TIMEOUT_MS)
     E.ensure_logged_in(page, email, password)
+    CURRENT_ACCOUNT.update(email=email, password=password)
     return context, page
 
 
@@ -854,7 +1258,11 @@ def main():
     state = State()
     state.report_previous_stop()
 
-    print(f"🎛️ Track: {lms_session.track_label(E.LMS_TRACK)} | mode: {'PLAN ONLY (nothing is changed)' if PLAN_ONLY else 'sync'}")
+    step_label = {"all": "sessions + upload", "sessions": "sessions only", "upload": "upload only"}[ARGS.step]
+    print(
+        f"🎛️ Track: {lms_session.track_label(E.LMS_TRACK)} | step: {step_label} | "
+        f"mode: {'CHECK ONLY (nothing is changed)' if PLAN_ONLY else 'check, then sync'}"
+    )
     if U.FORCE_REUPLOAD:
         print("♻️ Re-upload option is ON: sessions that already have attendance are uploaded again.")
     U.load_student_status()
@@ -867,6 +1275,8 @@ def main():
         return
 
     plan_rows = []
+    problems = []  # (profile, group, note): things that cannot be done automatically
+    group_upload_problems = {}  # (profile, group) -> latest upload problems
     totals = {"created": 0, "edited": 0, "uploaded": 0, "reuploaded": 0, "failed": 0}
     stopped = None
 
@@ -876,15 +1286,16 @@ def main():
         try:
             for track in tracks:
                 use_profiles(track)
+                P.TRACK = track
+                P.emit("phase", phase="check", status="running")
                 profile_name = E._PROFILE["name"]
-                groups, unmapped = groups_for_track(track)
-                for name in unmapped:
-                    print(f"⚠️ {profile_name}: no LMS group number for {name}; skipped.")
-                    plan_rows.append({"profile": profile_name, "group": name, "action": "skip", "reason": "no LMS group number"})
-                if not groups:
+                names = group_names_for_track(track)
+                if not names:
                     print(f"ℹ️ {profile_name}: no groups to check.")
                     continue
 
+                for name in names:
+                    P.emit("group", group=name, status="queued", phase="check")
                 email, password = lms_session.account_for_track(track)
                 if context is not None and email != current_email:
                     context.close()
@@ -893,60 +1304,164 @@ def main():
                     context, page = open_browser(p, email, password)
                     current_email = email
 
+                groups, unmapped = groups_for_track(track, names, lms_group_numbers(page, track))
+                for name in unmapped:
+                    print(f"⚠️ {profile_name}: {name} is not a group on the LMS course.")
+                    problem = {"action": "problem", "reason": "this group does not exist on the LMS course (ask for it to be added)"}
+                    plan_rows.append(plan_row(profile_name, name, problem))
+                    problems.append((profile_name, name, problem))
+                    P.emit("group", group=name, status="error", reason=problem["reason"])
+                if not groups:
+                    continue
+
                 # ---- SCAN every group in one go ----
+                print_stage(2, "Check missing", profile_name)
                 state.at("(scan)", "scan", f"{profile_name}: {len(groups)} groups")
                 urls = [U.build_target_url(g["num"], g["name"]) for g in groups]
                 t = time.time()
-                tables = scan_tables(page, urls)
+                tables = []
+                for offset in range(0, len(groups), SCAN_CONCURRENCY):
+                    batch = groups[offset:offset + SCAN_CONCURRENCY]
+                    for g in batch:
+                        P.emit("group", group=g["name"], status="running", phase="check")
+                    tables.extend(scan_tables(page, urls[offset:offset + SCAN_CONCURRENCY]))
+                    for g in batch:
+                        P.emit("group", group=g["name"], status="scanned", phase="check")
                 print(f"\n⚡ {profile_name}: read {len(groups)} group tables in {time.time() - t:.1f}s")
 
                 # ---- PLAN ----
                 work = []
                 for group, url, rows in zip(groups, urls, tables):
+                    P.emit("group", group=group["name"], status="running", phase="check")
+                    local_folder = os.path.join(U._p("EXPORTS_BASE_DIR"), group["name"])
+                    local_files = [f for f in os.listdir(local_folder) if f.lower().endswith('.csv')] if os.path.isdir(local_folder) else []
+                    P.emit("group", group=group["name"], folderCount=len(local_files))
+                    for existing in lms_sessions_from_rows(rows):
+                        item = {"date": existing["date_obj"], "title": existing["title"]}
+                        if P.in_scope(item):
+                            P.session(group["name"], item, "check", "done")
+                            P.session(group["name"], item, "sync", "done")
+                            P.session(group["name"], item, "upload", "done" if existing["attendance_taken"] else "pending")
                     title_actions, title_notes = plan_titles(group, lms_sessions_from_rows(rows))
-                    upload_actions, upload_notes = plan_uploads(group, rows)
-                    # A session that is about to be created is uploaded right
-                    # after, when its attendance CSV already exists.
-                    extra_uploads = 0
+                    if not DO_SESSIONS:
+                        title_actions, title_notes = [], []
+                    # One check sorts every session: create/edit only, create/edit
+                    # + upload (its attendance CSV is ready and not on the LMS
+                    # yet), or upload only.
                     for item in title_actions:
-                        if item["action"] != "create":
+                        if not DO_UPLOADS:
+                            continue
+                        if item["action"] == "edit" and item["candidate"].get("attendance_taken") and not U.FORCE_REUPLOAD:
                             continue
                         try:
                             session_type = U.extract_session_type_from_title(item["title"])
                             item["csv_path"] = U.find_csv_for_session(group["name"], item["date"], session_type)
-                            extra_uploads += 1
                         except Exception:
                             pass
+                    upload_actions, upload_notes = [], []
+                    if DO_UPLOADS:
+                        upload_actions, upload_notes = plan_uploads(
+                            group, rows, [i.get("csv_path") for i in title_actions]
+                        )
+                        # A session being fixed is uploaded with its new title, so it
+                        # is counted once, as "edit + upload".
+                        edited = {i["candidate"]["session_id"] for i in title_actions if i["action"] == "edit"}
+                        upload_actions = [u for u in upload_actions if u["session_id"] not in edited]
+                    for item in title_notes:
+                        problems.append((profile_name, group["name"], item))
+                    group_upload_problems[(profile_name, group["name"])] = upload_notes
                     for item in title_actions + title_notes + upload_actions + upload_notes:
                         plan_rows.append(plan_row(profile_name, group["name"], item))
                     counts = {
-                        "create": sum(1 for i in title_actions if i["action"] == "create"),
-                        "edit": sum(1 for i in title_actions if i["action"] == "edit"),
-                        "upload": sum(1 for i in upload_actions if i["action"] == "upload") + extra_uploads,
+                        "create only": sum(1 for i in title_actions if i["action"] == "create" and not i.get("csv_path")),
+                        "create + upload": sum(1 for i in title_actions if i["action"] == "create" and i.get("csv_path")),
+                        "edit only": sum(1 for i in title_actions if i["action"] == "edit" and not i.get("csv_path")),
+                        "edit + upload": sum(1 for i in title_actions if i["action"] == "edit" and i.get("csv_path")),
+                        "upload only": sum(1 for i in upload_actions if i["action"] == "upload"),
                         "reupload": sum(1 for i in upload_actions if i["action"] == "reupload"),
                     }
+                    for item in title_actions + upload_actions:
+                        P.session(group["name"], item, "check", "done")
+                        P.session(group["name"], item, "sync" if item["action"] in ("create", "edit") else "upload", "pending")
+                    for item in title_notes + upload_notes:
+                        P.session(group["name"], item, "check", "error", item.get("reason", ""))
+                    P.emit("group", group=group["name"], status="checked", phase="check", planned=counts,
+                           reason="No sessions in folder" if not local_files else "")
                     state.data["plan"][group["name"]] = counts
                     if any(counts.values()):
                         work.append((group, url, rows, title_actions, counts))
 
                 print("\n" + "-" * 100)
-                print(f"📋 {profile_name}: {len(work)} of {len(groups)} groups have something missing")
+                print(f"📋 CHECK - {profile_name}: {len(work)} of {len(groups)} groups have something missing")
                 for group, _, _, _, counts in work:
-                    print(
-                        f"   {group['name']:<16} create={counts['create']:<3} edit={counts['edit']:<3} "
-                        f"upload={counts['upload']:<3} reupload={counts['reupload']}"
-                    )
+                    print(f"   {group['name']:<16} " + " | ".join(f"{k}: {v}" for k, v in counts.items() if v))
+                totals_plan = {k: sum(w[4][k] for w in work) for k in (work[0][4] if work else {})}
+                if totals_plan:
+                    print("   " + "-" * 60)
+                    print("   TOTAL            " + " | ".join(f"{k}: {v}" for k, v in totals_plan.items() if v))
                 print("-" * 100)
                 state.save()
 
+                P.emit("phase", phase="check", status="done")
                 if PLAN_ONLY:
                     continue
 
-                # ---- SYNC only what is missing ----
-                for group, url, rows, title_actions, _ in work:
-                    stats = sync_group(page, state, profile_name, group, url, rows, title_actions)
-                    for k in totals:
-                        totals[k] += stats[k]
+                # ---- PHASE 1: create / fix the sessions of every group ----
+                session_work = [w for w in work if w[3]] if DO_SESSIONS else []
+                if DO_SESSIONS:
+                    print_stage(3, "Sync sessions (create / edit)", profile_name)
+                    if not session_work:
+                        print("✅ No session to create or fix.")
+                if session_work:
+                    P.emit("phase", phase="sync", status="running")
+                    print("\n" + "█" * 100)
+                    print(f"🗓️ PHASE 1 - {profile_name}: create / fix sessions in {len(session_work)} group(s)")
+                    print("█" * 100)
+                    for group, url, rows, title_actions, _ in session_work:
+                        stats = new_stats()
+                        started = time.time()
+                        print(f"\n🧩 {group['name']} | {url}")
+                        sync_sessions(page, state, group, url, title_actions, stats)
+                        print_group_done(group["name"], stats, started)
+                        add_stats(totals, stats)
+
+                # ---- PHASE 2: check again, then upload the attendance ----
+                if session_work:
+                    P.emit("phase", phase="sync", status="done")
+                if DO_UPLOADS:
+                    print_stage(4, "Upload attendance", profile_name)
+                    P.emit("phase", phase="upload", status="running")
+                    if session_work:
+                        # No second check: only the groups phase 1 changed are read
+                        # again, to get the links of the sessions just created.
+                        changed = {w[0]["name"] for w in session_work}
+                        idx = [i for i, g in enumerate(groups) if g["name"] in changed]
+                        t = time.time()
+                        fresh_tables = scan_tables(page, [urls[i] for i in idx])
+                        tables = list(tables)
+                        for i, fresh_rows in zip(idx, fresh_tables):
+                            tables[i] = fresh_rows
+                        print(f"\n⚡ {profile_name}: read the {len(idx)} changed group(s) again in {time.time() - t:.1f}s")
+                    upload_work = []
+                    for group, url, rows in zip(groups, urls, tables):
+                        actions, notes = plan_uploads(group, rows)
+                        group_upload_problems[(profile_name, group["name"])] = notes
+                        if actions:
+                            upload_work.append((group, url, rows, len(actions)))
+                    print("\n" + "█" * 100)
+                    print(
+                        f"⬆️ PHASE 2 - {profile_name}: upload attendance in {len(upload_work)} group(s), "
+                        f"{sum(w[3] for w in upload_work)} session(s)"
+                    )
+                    print("█" * 100)
+                    for group, url, rows, _ in upload_work:
+                        stats = new_stats()
+                        started = time.time()
+                        print(f"\n🧩 {group['name']} | {url}")
+                        notes = sync_uploads(page, state, group, url, rows, stats)
+                        group_upload_problems[(profile_name, group["name"])] = notes
+                        print_group_done(group["name"], stats, started)
+                        add_stats(totals, stats)
         except BlockedError as e:
             stopped = str(e)
         except KeyboardInterrupt:
@@ -960,7 +1475,10 @@ def main():
                 except Exception:
                     pass
 
+    P.emit("phase", phase="check" if PLAN_ONLY else ("upload" if DO_UPLOADS else "sync"), status="error" if stopped else "done", reason=stopped or "")
     write_plan_csv(plan_rows)
+    if not PLAN_ONLY:
+        write_results_excel(state)
     if U.MISSING_FROM_WAVZ_ROWS:
         try:
             U.write_missing_from_wavz()
@@ -986,6 +1504,20 @@ def main():
         )
         for f in state.data["failed"]:
             print(f"   ❌ {f['group']} | {f['step']} | {f['session']} | {f['reason']}")
+    for (profile_name, group_name), notes in group_upload_problems.items():
+        problems.extend((profile_name, group_name, n) for n in notes)
+    if problems:
+        print(f"\n⚠️ Needs your attention ({len(problems)}): these could not be done automatically")
+        for profile_name, group_name, n in problems:
+            P.TRACK = "nontechnical" if "non" in profile_name.lower() else "technical"
+            P.session(group_name, n, "check", "error", n.get("reason", ""))
+            d = n.get("date")
+            print(
+                f"   - {profile_name} | {group_name} | {d.isoformat() if d else ''} | "
+                f"{str(n.get('title', ''))[:60]} -> {n.get('reason', '')}"
+            )
+    else:
+        print("✅ Nothing skipped: every session in the CSVs is covered.")
     print(f"   Progress file: {STATE_PATH}")
     print(f"   Total time: {time.time() - run_started:.1f}s")
     print("#" * 100)
